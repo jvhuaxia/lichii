@@ -2,9 +2,11 @@ name: Windows PGO
 
 on:
   workflow_dispatch:
-  push:
-    branches: [nx2]
-    paths: [.github/workflows/windows-pgo.yml]
+    inputs:
+      source_ref:
+        description: Source branch or commit to build
+        type: string
+        default: nx2
 
 permissions:
   contents: read
@@ -30,7 +32,10 @@ jobs:
             mingw: true
     steps:
       - name: Check out source
+        id: source
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref }}
 
       - name: Check PGO profile
         if: matrix.pgo
@@ -167,14 +172,16 @@ jobs:
       - name: Smoke test packaged CLI
         shell: pwsh
         run: |
-          & ./build/release/bin/eden-cli.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "Packaged CLI failed: $LASTEXITCODE" }
+          $cli = (Resolve-Path ./build/release/bin/eden-cli.exe).Path
+          $process = Start-Process -FilePath $cli -ArgumentList '--version' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Packaged CLI failed: $($process.ExitCode)" }
+          Write-Host "Packaged CLI --version passed with exit code $($process.ExitCode)"
 
       - name: Upload MinGW binary
         if: matrix.mingw
         uses: actions/upload-artifact@v7
         with:
-          name: lichii-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}-${{ steps.source.outputs.commit }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 30
