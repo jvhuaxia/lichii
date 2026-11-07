@@ -64,6 +64,9 @@ struct Runtime {
     u32 GetStorageBufferAlignment() const {
         return alignment;
     }
+    u64 GetMaxStorageBufferRange() const {
+        return 128ULL << 20;
+    }
     u32 GetUniformBufferAlignment() const {
         return 1;
     }
@@ -341,11 +344,11 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     f.Descriptor(base, 256);
     REQUIRE(f.Bind().size == 4096);
     REQUIRE(f.Bind(false, true).size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     REQUIRE(f.Bind(true, false, true).size == 256);
     f.Descriptor(base, (1ULL << 32) | 256);
     REQUIRE(f.Bind().size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     f.Descriptor(base + (79 << 20), 0);
     REQUIRE(f.Bind(false, false, true).size == 1 << 20);
 }
