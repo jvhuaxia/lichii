@@ -1,0 +1,184 @@
+Lichii OoT integration 2026-11-07
+Integration branch: codex/oot-20261107
+Locked integration commit: 90856c3014288ae6131012e480ad9e1ff69173a4
+Upstream nx2 baseline: 9fa4a71fa051aa857e2d8f370aa31739a4f062c2
+Fork bundle prerequisite: 07971d35aef82822955080fbbb8c900864acc20a
+Repository: https://github.com/zortos293/Lichii
+Destination: https://github.com/jvhuaxia/lichii
+
+Scope: compatible non-draft OoT fixes and optional features. Historical bisect,
+diagnostic, superseded and speculative integration branches are excluded.
+Gameplay and local native compilation have NOT been performed. GitHub Actions
+must build both executables and the tests target, run selected regression tests,
+package runtime dependencies, and smoke-test the CLI before delivery.
+
+DIRECT MERGES (original PR histories and authors preserved)
+#408 6ca176e59e1d8b8aec80a1f919affc3a2bca2ec3 Ocarina of Time: stop mid-game pipeline rebuilds and slow compute builds (with ports of #174, #250, #288, #319 and Eglantine #634, #639)
+https://github.com/zortos293/Lichii/pull/408
+
+#206 2b5cfdd0b9f6ca236d52acfef44be98961016819 shader: retry compare-exchange loops with the value the exchange returned
+https://github.com/zortos293/Lichii/pull/206
+
+#178 994b99c35b86979fbe513edaf17f0a29e905d0f7 video_core: skip the instance loop writes the split back ignores
+https://github.com/zortos293/Lichii/pull/178
+
+#245 1735209618c4f7a5eda46b5b13d8ade9acfa9da5 video_core: read bindless handle words from the host-aligned storage base
+https://github.com/zortos293/Lichii/pull/245
+
+#264 9fdc5a59c0d2b952a6f13546ab49c5ac33d4a4a1 buffer_cache: arm read traps only on the pages not armed yet
+https://github.com/zortos293/Lichii/pull/264
+
+#279 40d19de2d5df0cec2d33a79e3ce1066accc8a405 shader: shadow high registers of IMAD with a uniform multiplier
+https://github.com/zortos293/Lichii/pull/279
+
+#299 ad6963c420302b88857bc1917c870763f4d4388b file_sys: keep Ocarina's Dynamic FPS real down to 10 fps
+https://github.com/zortos293/Lichii/pull/299
+
+#310 6096322bf343471a4cefeeff3a1539b53e7d111f dynarmic: wait for the code space commit instead of emitting past it
+https://github.com/zortos293/Lichii/pull/310
+
+#311 34f9bf4bd68e61292c231615783625d8d5978bd0 texture_cache: match the clear-skip check to the clear's real coverage
+https://github.com/zortos293/Lichii/pull/311
+
+#321 6239a4d83cd4f4a2e2024750dfc40f978aa75842 vk_graphics_pipeline: build a held draw's pipeline inline again for worker-only builds
+https://github.com/zortos293/Lichii/pull/321
+
+#329 5a3aab65f88bb4cd034f04aa64fd572ccad37310 vk_graphics_pipeline: run graphics warp ops at the guest's warp size (Ocarina white leaves on Intel)
+https://github.com/zortos293/Lichii/pull/329
+
+#337 0f0720d07ddeeb52b0f59826b2e79b6b03302ab3 query_cache: keep fence-flagged reports pending until their fence runs (Ocarina white flashes)
+https://github.com/zortos293/Lichii/pull/337
+
+#351 fd4141e48c35e7436abc36b0031e2d05782bf4bf buffer_cache: bind table-pointer pools as far as a storage buffer rea…
+https://github.com/zortos293/Lichii/pull/351
+
+#353 fc731789dcc276f55e1d85e1ad81c32628e6b705 vulkan: don't write render target components the fragment shader does…
+https://github.com/zortos293/Lichii/pull/353
+
+#376 999056f5f2d697cc9a23382917e49f510678a290 texture_cache: download the collector's evicted images with one GPU wait
+https://github.com/zortos293/Lichii/pull/376
+
+#395 a438bc94cfd34b1f7c1b7735a62a6c9d9c87dd5e vulkan: rebuild native compute pipelines whose pointer slot was null at translation (OoT near hedges)
+https://github.com/zortos293/Lichii/pull/395
+
+#270 f7130c8b122a5caaabd125d14c54a08cfb5babaf nx2: add an FPS limit for the game's present rate
+https://github.com/zortos293/Lichii/pull/270
+
+#251 e965abdde60de440fd03d5be2c5288faa5afe04d nx2:vdec: keep Ocarina's movies in time with their sound below 60 fps
+https://github.com/zortos293/Lichii/pull/251
+
+#354 ac07a188be908e17a7624e347f83ae74447a6f2c Fix Ocarina of Time's green tint on AMD: bind light-table shadow maps through descriptor arrays
+https://github.com/zortos293/Lichii/pull/354
+
+#415 a083c95f0875dd04ff5cf9d3b5a03dd7f78b6e15 video_core: mark native compute storage bindings only as far as the shader's stores reach
+https://github.com/zortos293/Lichii/pull/415
+
+#300 54a45b5774abd47fa32a6a2f420373527aa3f728 vulkan: build software HMMA compute pipelines off the wait path on AMD drivers
+https://github.com/zortos293/Lichii/pull/300
+
+#418 c5d51c5b335ef8aab444382d2d76cda1f551a3d1 common, video_core: experimental setting to pin the split GPU threads to their own cores
+https://github.com/zortos293/Lichii/pull/418
+
+#143 379ce5fb877fb53ec98c077c971b04fef23ccf65 video_core: don't emulate tensor programs on Mesa's Intel driver; stand in for Ocarina's upscaler
+https://github.com/zortos293/Lichii/pull/143
+
+#387 86f4a1e099e5febc21139ca0a0b12fa0ce44531a video_core, qt: NVIDIA DLSS toggle hotkey, sharpness and DLAA above 1x for Ocarina
+https://github.com/zortos293/Lichii/pull/387
+
+#345 cc808c195f966b5995564e74170ed3adef908919 video_core: precise split-front DMA reads, per-bind native bank checks, query flush before macro reads (Ocarina perf and white flashes)
+https://github.com/zortos293/Lichii/pull/345
+
+INCLUDED THROUGH OTHER PRS / ALREADY ABSORBED
+- #408 ports #174 (K8 HMMA unroll), #250 (page filters), #288 (whole-copy upload
+  skip), #319 (optional OoT no-sharpen network bypass), and Eglantine #634/#639.
+  They are not merged a second time as independent changes.
+- #387 includes #253's optional NVIDIA DLSS/DLAA implementation in its ancestry.
+  #387 adds runtime toggle, sharpness and resolution-scaled DLAA controls.
+- #206's merge changes no tree files: the upstream baseline already contains the
+  same CAS-loop behavior. Its source history is retained, not applied twice.
+- #204 is already addressed by upstream #215; #345 adapts the same query-flush
+  mechanism to its precise split-front read tracking.
+- Latest upstream nx2 includes the previously integrated #121/#127 and the
+  newer #184/#194/#215/#240/#284/#295/#397/#398/#410/#412/#413/#414/#232 landings.
+- Historical fix/oot-boot, fix/oot-bloom, fix/oot-upscaler-gathers,
+  feat/oot-builtin-maxres, capy/fix-oot-amd-ssbo-alignment-sync,
+  capy/oot-paired-cbuf-loaded-pointer and port/ducky-oot-nx2 branches have
+  production equivalents in nx2. perf/oot-* chains are pre-#184 checkpoints;
+  their validated production paths are already absorbed by upstream.
+
+MERGE RESOLUTION / INTEGRATION FOLLOW-UPS
+- #353 + #408: keep both the dynamic fragment color component mask and
+  OotNetwork bypass state in RasterizerVulkan.
+- #354 + #245: handle-table descriptor arrays retain host-aligned storage bases
+  on Vulkan and OpenGL. The evaluator takes element and storage_alignment;
+  batching and single-handle evaluation use the same aligned base. Existing
+  alignment tests are retained and an array+alignment regression section added.
+- #415 + #354: preserve indirect_offset and write_extent through descriptor
+  joining/remapping and both compute pipeline backends.
+- #300 + #395: retain deferred AMD HMMA compilation and null-pointer-slot
+  pipeline rebuilding together.
+- #143 + #387 + #408: retain all three independent interfaces (Intel tensor
+  stand-in, optional NVIDIA DLSS/DLAA, optional no-sharpen network bypass).
+  DLSS and No sharpening remain opt-in; Game remains the bypass default.
+- #345 is the reviewed cc808c195f version: learned acquires removed, opaque
+  writes/aliases tracked, High accuracy kept out of the release shortcut,
+  report writes tracked globally, query wait bounded with shared callback state.
+  Preserve #178's instance-loop state and #397's pending CPU-write enumeration.
+- 8e3a873f1a: semantic merge repair only. Auto-merge created duplicate
+  OnCacheInvalidations methods because u64/size_t spellings hid their equivalence.
+  Keep one method, ClaimCpuWrites first (#397 correctness), then batch cache
+  locks and pipeline invalidations (#345). No new game-specific algorithm.
+- 90856c3014: the storage-binding test mock gains GetMaxStorageBufferRange for
+  #351 and expects the full mapped 80 MiB read-only pool instead of obsolete
+  64 MiB cap. This prevents a test-template compile failure and stale assertions.
+
+SKIPPED / ALTERNATIVES
+- #161/#166: old broad timing/performance packages with substantial overlap and
+  opt-in experiment plumbing; prefer current upstream plus focused production PRs.
+- #179 and #411: drafts / work in progress; not ready to merge.
+- #231: depends on #179's draft semaphore fast-path and includes its ancestry.
+  #345 provides reviewed independent split-front handling instead.
+- #216: alternative real-time hook patches the same game instruction as already
+  bundled #240 Dynamic FPS; keep #240 and apply #299's 10-fps clamp adjustment.
+- #223: 142-file historical AMD/performance/debug package; many pieces already
+  merged and its author explicitly lists experiment switches not for nx2.
+  Focused AMD HMMA #300 is included instead.
+- #235: opt-in High-accuracy split path; #408 reports fog/occlusion regressions
+  when testing it. Not needed for current production default.
+- #243: alternative precise DMA-read implementation, overlaps #345's front
+  write/report tracking. Do not stack competing implementations.
+- #259: experimental preflush switch with acknowledged visual flicker.
+- #267: mixed historical 60-fps integration package; overlaps #243/#311/query
+  handling and changes SSBO capacity to 64 while #354 uses 32-bit binding masks.
+  Exact current tip lacks matched gameplay validation. Do not merge wholesale.
+- #292: alternative 256-MiB compute-only read-only-pool cap; choose newer #351's
+  mapping/host-range policy rather than overlay two policies for the same issue.
+- #313: alternative pipeline eviction budget; #408 provides the tested combined
+  key/budget/DontInline path with a more conservative 1/16-RAM budget.
+- #278: optional filesystem throttle experiment; default behavior unchanged,
+  limited validation. Focused #251 movie/audio clock fix included instead.
+- #301/#309/#377/#182/#186: diagnostics / sampling / logging-only changes are
+  outside this gameplay integration scope.
+- #282/#318: closed predecessors of #319, which is ported by #408.
+- bisect/oot-*, exp/oot-*, test/oot-*, port/ducky-oot-build16, fix/oot-fog and
+  perf/oot-* historical branches contain bisection points, visual workarounds,
+  diagnostics or earlier candidates. No historical branch is merged wholesale.
+
+REGRESSION FILTERS
+Existing planned filter:
+[ampere],[shader],[oot_network],[ocarina_upscale],[fe_upscale],[dlss_contract],[starfox_upscale],[core_pinning]
+Additional precise tags:
+[storage_extent],[texture_handles],[cpu_readback],[read_traps],[buffer_ports],[pipeline_cache],[page_filter],[coherence],[nx2_present_pacer]
+Additional exact test name (only broadly tagged video_core):
+Uniform stream reuse preserves data through mutation and session resets
+Avoid selecting all [video_core]: known unrelated nx2_video_render / nup_writer
+failures exist upstream. Tests were not run locally: native clang/cmake/ninja
+are unavailable here. Cloud build and focused regression run are required.
+
+STATIC CHECKS
+- All 25 directly selected PR head SHAs verified as ancestors of HEAD.
+- git diff --check upstream/nx2 HEAD passes.
+- No conflict markers remain in source/workflow files.
+- Handle evaluator, write-extent parameter and invalidation API call sites checked.
+- Only .github/workflows/windows-pgo.yml differs in .github relative to upstream;
+  that existing user workflow was not edited by this integration.
