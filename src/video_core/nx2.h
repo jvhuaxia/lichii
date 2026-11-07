@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -71,12 +73,43 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+// Device pages that reports were sent to (same layout as above): the front's MME DMA reads of
+// them write out the reports the query cache still holds first. The front marks the 3D reports
+// it queues; the back marks every report left pending, from any engine or channel.
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_report_pages{};
+
+inline void Nx2MarkReportPages(u64 device_address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
+                                   g_nx2_report_pages.size() * 64 - 1);
+    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
+        auto& word = g_nx2_report_pages[page / 64];
+        const u64 bit = u64{1} << (page % 64);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_relaxed);
+        }
+    }
+}
+
+[[nodiscard]] inline bool Nx2IsReportPage(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_report_pages.size() * 64) {
+        return false;
+    }
+    return (g_nx2_report_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+}
+
 /// A new emulation session starts: no page has been written by its GPU yet.
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);
     }
     for (auto& word : g_nx2_command_list_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
+    for (auto& word : g_nx2_report_pages) {
         word.store(0, std::memory_order_relaxed);
     }
     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
@@ -391,12 +424,33 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    latched = true;
+                }
+            }
+            if (latched) {
+                ++latch_epoch;
             }
         }
+        if (latched) {
+            latch_cv.notify_all();
+        }
+    }
+
+    [[nodiscard]] u64 LatchEpoch() {
+        std::scoped_lock lk{mutex};
+        return latch_epoch;
+    }
+
+    /// Sleeps until a waiter latches after `seen` (LatchEpoch) or `timeout` passes.
+    void WaitForLatch(u64 seen, std::chrono::microseconds timeout) {
+        std::unique_lock lk{mutex};
+        latch_cv.wait_for(lk, timeout, [&] { return latch_epoch != seen; });
     }
 
 private:
@@ -422,6 +476,8 @@ private:
     }
 
     std::mutex mutex;
+    std::condition_variable latch_cv;
+    u64 latch_epoch{};
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
 };
