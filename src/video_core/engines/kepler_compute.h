@@ -66,6 +66,13 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    [[nodiscard]] bool MayWriteMemory(u32 method) const {
+        if (method >= native_plain_methods.size()) {
+            return true;
+        }
+        return native_mode ? !native_plain_methods[method] : execution_mask[method];
+    }
+
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {
@@ -246,7 +253,20 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
+    /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
+    /// tonemapped image.
+    bool BypassOotNetwork(u64 program_id, u64 native_key);
+    /// Draws a plain upscale of a rejected tensor program's input in its place.
+    [[nodiscard]] bool UpscaleInsteadOfNativeProgram();
+    /// NVIDIA DLSS in place of Ocarina of Time's anti-aliasing (ocarina_upscale.h), when the
+    /// setting is on: true when it replaced this dispatch (the network's last pass).
+    bool ProcessOcarinaUpscale(u64 program_id, u64 shader_hash);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
+
+    /// Whether the matrix multiplies (tensor-core instructions) of native compute programs are
+    /// emulated; rejected ones get UpscaleInsteadOfNativeProgram.
+    [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -271,6 +291,8 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();
@@ -312,9 +334,12 @@ private:
     /// colour image and camera jitter they go with.
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     std::optional<Texture::TICEntry> dlss_depth;
+    std::array<f32, 2> dlss_jitter{};
     u32 dlss_contract_trace_count{};
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
+    /// The tonemapped frame Ocarina of Time's anti-aliasing reads (ProcessOcarinaUpscale).
+    std::optional<Texture::TICEntry> ocarina_input;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

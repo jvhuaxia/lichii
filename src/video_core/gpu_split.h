@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -10,6 +11,8 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -75,6 +78,15 @@ public:
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
+    }
+    /// Marks the calling thread as the GPU thread (the front, or the only one without the split).
+    static void MarkGpuThread() {
+        on_gpu_thread = true;
+    }
+    /// Whether the calling thread owns the Vulkan scheduler: the back while it runs, else the
+    /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
+    [[nodiscard]] static bool OwnsScheduler() {
+        return Get().BackRunning() ? on_back_thread : on_gpu_thread;
     }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
@@ -175,7 +187,76 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
+    /// Work that may write guest memory at addresses the front does not track was just sent.
+    /// `source` names the sender for EDEN_NX2_MME_DMA_STATS.
+    void NoteMemoryBarrier(u32 source = 0) {
+        last_barrier_position = write_position;
+        last_barrier_source = source;
+    }
+    [[nodiscard]] u32 MemoryBarrierSource() const {
+        return last_barrier_source;
+    }
+    /// Where the last untracked memory write (or compute and copy work) was sent.
+    [[nodiscard]] u64 MemoryBarrierPosition() const {
+        return std::max(last_barrier_position, last_writer_position);
+    }
+    [[nodiscard]] u64 WriterPosition() const {
+        return last_writer_position;
+    }
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// How far the back has executed.
+    [[nodiscard]] u64 Consumed() {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return consumed_cache;
+    }
+    /// Waits until the back executed everything sent before `target`.
+    void WaitForPosition(u64 target, DrainSite site) {
+        WaitFor(std::min(target, write_position), site);
+    }
+
+    /// Work just sent writes [begin, end) of the GPU address space `space` (a memory manager).
+    /// `opaque`: the front does not know the data written.
+    void NoteMemoryWrite(const void* space, u64 begin, u64 end, bool opaque = true) {
+        if (end <= begin) {
+            return;
+        }
+        if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
+            NoteMemoryBarrier(0x40001);
+            return;
+        }
+        if (write_blocks.size() >= 8192 && Consumed() >= latest_block_write) {
+            write_blocks.clear();
+            opaque_blocks.clear();
+        }
+        if (write_blocks.size() >= 65536) {
+            write_blocks.clear();
+            opaque_blocks.clear();
+            NoteMemoryBarrier(0x40000);
+        }
+        NoteBlocks(write_blocks, space, begin, end);
+        latest_block_write = write_position;
+        if (opaque) {
+            NoteBlocks(opaque_blocks, space, begin, end);
+            latest_opaque_write = write_position;
+        }
+    }
+    /// The position the back must reach before [begin, end) of `space` can be read: the last
+    /// untracked write, or the last queued write that overlaps it.
+    [[nodiscard]] u64 ReadReadyPosition(const void* space, u64 begin, u64 end) {
+        return ReadyPosition(write_blocks, latest_block_write, space, begin, end);
+    }
+    /// As ReadReadyPosition, for writes whose data the front does not know.
+    [[nodiscard]] u64 OpaqueReadyPosition(const void* space, u64 begin, u64 end) {
+        return ReadyPosition(opaque_blocks, latest_opaque_write, space, begin, end);
+    }
+    /// The position after the last queued tracked write to [begin, end), untracked writes aside.
+    [[nodiscard]] u64 TrackedWritePosition(const void* space, u64 begin, u64 end);
+
 private:
+    friend struct GpuSplitTestAccess;
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -222,8 +303,19 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
+    /// One step of a front wait for the back to consume `target`.
+    void Backoff(u32 spins, u64 target);
+    /// After the back stored `consumed`: wakes a front sleeping in Backoff.
+    void NotifyFront() {
+        if (front_waiting.load(std::memory_order_seq_cst)) {
+            front_wake.fetch_add(1, std::memory_order_seq_cst);
+            front_wake.notify_one();
+        }
+    }
+
     void BackLoop(std::stop_token stop_token);
-    size_t Execute(const u64* entry);
+    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
+    size_t Execute(const u64* entry, size_t words);
 
     Core::System* system{};
     bool active{};
@@ -233,6 +325,31 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_barrier_position{};
+    u32 last_barrier_source{};
+    // Queued tracked writes: the ring position after the last write to each 64-byte block.
+    static constexpr u64 WriteBlockShift = 6;
+    static constexpr u64 MaxWriteBlocks = 1024;
+    std::unordered_map<u64, u64> write_blocks;
+    std::unordered_map<u64, u64> opaque_blocks;
+    u64 latest_block_write{};
+    u64 latest_opaque_write{};
+    // Keyed by the backing memory (`space` is a Tegra::MemoryManager), so writes and reads
+    // through different GPU addresses of the same memory meet.
+    void NoteBlocks(std::unordered_map<u64, u64>& blocks, const void* space, u64 begin, u64 end);
+    u64 BlocksPosition(const std::unordered_map<u64, u64>& blocks, const void* space, u64 begin,
+                       u64 end) const;
+    u64 ReadyPosition(const std::unordered_map<u64, u64>& blocks, u64 latest, const void* space,
+                      u64 begin, u64 end) {
+        u64 target = MemoryBarrierPosition();
+        if (end <= begin || blocks.empty() || latest <= target) {
+            return target;
+        }
+        if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
+            return std::max(target, latest);
+        }
+        return std::max(target, BlocksPosition(blocks, space, begin, end));
+    }
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};
@@ -243,12 +360,21 @@ private:
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
 
+    /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
+    /// idle hook ran, cleared before it executes entries.
+    [[nodiscard]] bool BackQuiet() const {
+        return back_quiet.load(std::memory_order_acquire) ||
+               !back_running.load(std::memory_order_acquire);
+    }
+
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
+    static inline thread_local bool on_gpu_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
+    std::atomic<bool> back_quiet{true};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.
@@ -258,6 +384,9 @@ private:
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
+    /// The front sleeps in Backoff (#161: instead of yielding).
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
     std::jthread back_thread;
 };
 

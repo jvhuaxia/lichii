@@ -88,6 +88,9 @@ enum class RenderTargetFormat : u32 {
     X1R5G5B5_UNORM = 0xF8,
     X8B8G8R8_UNORM = 0xF9,
     X8B8G8R8_SRGB = 0xFA,
+
+    // Host-only (not a guest render target value): the 2D copies of the upscale fallback.
+    E5B9G9R9_FLOAT = 0x100,
     /*
     Z1R5G5B5_UNORM = 0xFB,
     O1R5G5B5_UNORM = 0xFC,
@@ -148,6 +151,11 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
+    /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
+    /// applied yet.
+    void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
+    /// Returns true when guest CPU writes to the range are collected but not yet applied.
+    [[nodiscard]] bool HasPendingCPUWrites(DAddr addr, u64 size);
     /// Signal the ending of command list.
     void OnCommandListEnd();
 

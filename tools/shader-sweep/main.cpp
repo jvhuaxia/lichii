@@ -102,6 +102,10 @@ u64 CbufKey(u32 bank, u32 offset) {
     return (u64{bank} << 32) | offset;
 }
 
+u64 IndirectCbufKey(u32 bank, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (u64{indirect & 0x3fffff} << 40) | CbufKey(bank, offset);
+}
+
 class OfflineEnvironment final : public Shader::Environment {
 public:
     void Load(std::span<const u8> bytes, u32 version) {
@@ -242,6 +246,10 @@ public:
     }
     bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
         return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
+    }
+    bool IsCbufIndirectStorageBufferPointer(u32 bank, u32 offset, u32 indirect) override {
+        return Lookup(pointers, IndirectCbufKey(bank, offset, indirect),
+                      "storage pointer table classification") != 0;
     }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
         return Lookup(cbuf_values, CbufKey(bank, offset), "constant buffer value");
@@ -531,7 +539,7 @@ int main(int argc, char** argv) {
                 std::cout << "shader-sweep [INPUT] [--stage "
                              "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50]\n"
+                             "--cache-version 46|47|48|49|50|51|52]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
                              "(--output SPV | --lower-only WORDS)\n";
                 return 0;
@@ -558,8 +566,9 @@ int main(int argc, char** argv) {
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
             else if (arg == "--cache-version") {
-                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50")
-                    throw std::runtime_error("Expected cache version 46, 47, 48, 49 or 50");
+                if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
+                    value != "51" && value != "52")
+                    throw std::runtime_error("Expected cache version 46 to 52");
                 version = static_cast<u32>(std::stoul(value));
             } else if (arg == "--output" || arg == "--lower-only") {
                 if (!output.empty())
@@ -721,6 +730,7 @@ int main(int argc, char** argv) {
         host.support_conditional_barrier = true;
         host.support_viewport_index_layer = true;
         host.support_geometry_shader_passthrough = true;
+        host.support_handle_table_arrays = true;
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
@@ -741,6 +751,8 @@ int main(int argc, char** argv) {
         profile.max_user_clip_distances = 8;
         profile.max_subgroup_size = 32;
         profile.support_typeless_image_loads = true;
+        // Handle table arrays are indexed per invocation, as with Vulkan.
+        profile.support_sampled_image_array_nonuniform_indexing = true;
         Shader::Backend::Bindings bindings{};
         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
         diagnostic["spirv_words"] = spirv.size();

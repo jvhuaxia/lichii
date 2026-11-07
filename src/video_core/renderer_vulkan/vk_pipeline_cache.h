@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -34,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 
@@ -109,6 +111,9 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
+    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
+    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -136,6 +141,8 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
+    /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
@@ -143,7 +150,10 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel);
+        bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+
+    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                      const ShaderInfo* shader);
@@ -173,20 +183,28 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    const size_t num_pipeline_workers;
+    EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
+    u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the program's mask
     GraphicsPipeline* current_pipeline{};
 
-    /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
+    /// Over the pipeline memory budget, destroys the least recently used graphics pipelines unused
+    /// for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
+    /// Replaced compute pipelines; command buffers in flight may still use them.
+    std::vector<std::unique_ptr<ComputePipeline>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
+    std::mutex spare_pools_mutex;
+    std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
@@ -211,8 +229,12 @@ private:
     std::atomic_bool flush_in_flight{};
 
     Common::ThreadWorker workers;
+    /// Software HMMA compute pipelines on drivers that take minutes on them
+    /// (Device::DefersSoftwareMatrixPipelines); nothing waits for this worker.
+    Common::ThreadWorker deferred_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
+    PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 };
 
 } // namespace Vulkan

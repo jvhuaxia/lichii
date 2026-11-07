@@ -27,6 +27,7 @@
 #include "qt_common/config/qt_config.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
+#include "yuzu/compatibility_report.h"
 #include "yuzu/hotkeys.h"
 #include "yuzu/user_data_migration.h"
 
@@ -473,6 +474,7 @@ private:
     bool CheckFirmwarePresence();
     void SetFirmwareVersion();
     void SetFPSSuffix();
+    void ShowOsdMessage(const QString& text);
     /**
      * Open (or not) the right confirm dialog based on current setting and game exit lock
      * @returns true if the player confirmed or the settings do no require it
@@ -525,6 +527,8 @@ private:
 
     // Status bar elements
     QLabel* message_label = nullptr;
+    QLabel* osd_label = nullptr; ///< Short messages over the game, see ShowOsdMessage
+    QTimer osd_timer;
     QLabel* shader_building_label = nullptr;
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
@@ -552,6 +556,7 @@ private:
 
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
+    std::optional<CompatibilityReporting::Session> report_session;
     bool boot_in_progress = false;
     bool close_pending = false;
     // The path to the game currently running

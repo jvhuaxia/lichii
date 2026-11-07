@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <utility>
+#include <vector>
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
@@ -84,6 +86,22 @@ public:
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
+
+    /// Native programs: whether the 8 bytes at `indirect` past the pointer at (index, offset) are
+    /// a mapped GPU address (a pointer table the program loads its buffer pointer from).
+    [[nodiscard]] virtual bool IsCbufIndirectStorageBufferPointer(u32, u32, u32) {
+        return true;
+    }
+
+    /// Native programs: (index, offset) slots classified as non-pointers because they were null.
+    [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
+        return {};
+    }
+
+    /// Native programs: how many classified slots were bound as storage buffer pointers.
+    [[nodiscard]] virtual size_t MappedStoragePointerCount() const {
+        return 0;
+    }
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 

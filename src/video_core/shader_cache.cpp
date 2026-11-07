@@ -31,6 +31,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/pipeline_cache_policy.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -269,6 +270,12 @@ const ShaderInfo* ShaderCache::ComputeShader() {
                                                      *kepler_compute, *gpu_memory, bank, offset);
                                              }))
             throw Shader::Ampere::TrapGuardError{};
+    } else if (kepler_compute->IsNativeMode() && IsRejected(*cpu_shader_addr)) {
+        // A rejected program fails the same way on every dispatch. GetGraphicsEnvironments
+        // skips those draws without rethrowing; doing the same here avoids two C++ throws, a
+        // mutex-guarded insert and an exception_ptr for each dispatch of the program. The
+        // caller already turns a missing shader into a failed dispatch.
+        return nullptr;
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
@@ -290,7 +297,15 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        kepler_compute->BypassOotNetwork(program_id, shader->lowered_native->native_program_key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    if (kepler_compute->IsNativeMode() &&
+        kepler_compute->ProcessOcarinaUpscale(program_id, shader->unique_hash)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;
@@ -310,6 +325,11 @@ bool ShaderCache::IsRejected(VAddr addr) {
 
 void ShaderCache::RememberRejection(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
+    if (rejected_native.contains(addr)) {
+        // Called from a catch block: keep the first exception for that address instead of
+        // capturing and inserting a new one on every rejected dispatch.
+        return;
+    }
     rejected_native.emplace(addr, std::current_exception());
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
@@ -355,6 +375,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
 
     const VAddr addr_end = addr + size;
     Entry* const entry = NewEntry(addr, addr_end, data.get());
+    page_filter.Mark(addr, size);
 
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
@@ -482,6 +503,21 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->size_bytes = env.ReadSizeBytes();
     }
     info->lowered_native = env.LoweredNative();
+    if (info->lowered_native && env.ShaderStage() == Shader::Stage::VertexB) {
+        // The hardware only fetches the attributes in the input map, so a read outside it is
+        // never valid (none of Ocarina of Time's 1,250 cached vertex programs makes one).
+        std::array<std::array<bool, 4>, Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes>
+            input_generic{};
+        for (size_t index = 0; index < input_generic.size(); ++index) {
+            input_generic[index] = env.SPH().vtg.InputGeneric(index);
+        }
+        info->vertex_attribute_mask = VertexAttributeMask(input_generic);
+    } else if (env.ShaderStage() == Shader::Stage::Task ||
+               env.ShaderStage() == Shader::Stage::Mesh) {
+        // Task and mesh pipelines have no vertex input (Ocarina of Time: 191 keys for 31 sets of
+        // shaders, split only by the attribute registers).
+        info->vertex_attribute_mask = 0;
+    }
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <tuple>
 #include <set>
+#include <span>
 #include <fstream>
 #include <mutex>
 #include <string_view>
@@ -51,6 +53,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/game_dlss_status.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -60,6 +63,8 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
@@ -71,6 +76,40 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+
+/// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
+/// read as the GPU reads it, without flushing GPU caches.
+VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
+                                                 GPUVAddr address, u64 size) {
+    VideoCore::Nx2Debug::GpuReadResult result{};
+    if (spaces.empty()) {
+        result.error = "no GPU address space is bound yet";
+        return result;
+    }
+    for (Tegra::MemoryManager* const space : spaces) {
+        if (space->IsFullyMappedRange(address, size)) {
+            result.bytes.resize(size);
+            space->ReadBlockUnsafe(address, result.bytes.data(), size);
+            result.address_space = space->GetID();
+            return result;
+        }
+    }
+    constexpr u64 page_mask = 0xfff;
+    const GPUVAddr end = address + size;
+    GPUVAddr first = address;
+    while (first < end) {
+        const GPUVAddr next = (std::min)((first | page_mask) + 1, end);
+        if (!spaces.front()->IsFullyMappedRange(first, next - first)) {
+            break;
+        }
+        first = next;
+    }
+    result.error = fmt::format("GPU address {:#x} is not mapped (the first unmapped byte in the "
+                               "bound channel's address space; {} address spaces checked)",
+                               first, spaces.size());
+    return result;
+}
+
 struct DrawParams {
     u32 base_instance;
     u32 num_instances;
@@ -243,8 +282,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(device, memory_allocator, scheduler), wfi_event(device.GetLogical().CreateEvent()) {
+      frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    buffer_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
@@ -396,6 +439,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         return;
     }
+    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+        TrackOotTonemappedImage(*pipeline);
+    }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
@@ -434,18 +480,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
 
+    TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
+        bool recorded = false;
         if (frame_dump.CapturingSampled()) {
             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
             for (const auto& image : pipeline->SampledImages()) {
-                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id)});
+                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
+                                   &texture_cache.GetSampler(image.sampler)});
             }
-            if (frame_dump.NoteSampled(sampled)) {
-                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-            }
+            recorded = frame_dump.NoteSampled(sampled);
+        }
+        if (frame_dump.CapturingBuffers()) {
+            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+        }
+        if (recorded) {
+            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
         }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
@@ -465,9 +518,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    NoteCameraMotionDraw();
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
-        UpdateDynamicStates();
+        UpdateDynamicStates(pipeline);
     }
 
     query_cache.NotifySegment(true);
@@ -756,12 +810,18 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
-            scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
             return;
         }
         scheduler.Record([this, draw_params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
             scheduler.TraceGpuWork(
                 cmdbuf, hashes.first, hashes.second,
                 {draw_params.num_vertices, draw_params.num_instances, 0}, [&] {
@@ -821,8 +881,11 @@ void RasterizerVulkan::DrawIndirect() {
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
         if (params.is_byte_count) {
-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
+            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
                                                 static_cast<u32>(stride));
             });
@@ -832,9 +895,12 @@ void RasterizerVulkan::DrawIndirect() {
             const auto count = buffer_cache.GetDrawIndirectCount();
             const auto& draw_buffer = count.first;
             const auto& offset_base = count.second;
-            scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
+            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
@@ -849,6 +915,9 @@ void RasterizerVulkan::DrawIndirect() {
         }
         scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params,
                           hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
             scheduler.TraceGpuWork(cmdbuf, hashes.first, hashes.second, {}, [&] {
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
@@ -873,6 +942,18 @@ void RasterizerVulkan::DrawIndirect() {
         }
     }, true);
     buffer_cache.SetDrawIndirect(nullptr);
+}
+
+void RasterizerVulkan::TrackOotTonemappedImage(const GraphicsPipeline& pipeline) {
+    const auto& hashes = pipeline.ShaderHashes();
+    if (std::none_of(hashes.begin(), hashes.end(), VideoCommon::OotNetwork::IsTonemapShader)) {
+        return;
+    }
+    const GPUVAddr target = maxwell3d->regs.rt[0].Address();
+    if (target != 0 &&
+        oot_network_bypass.tonemapped_image.exchange(target, std::memory_order_relaxed) != target) {
+        LOG_INFO(Render_Vulkan, "Ocarina of Time: tonemapped image at {:#x}", target);
+    }
 }
 
 void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
@@ -1036,7 +1117,7 @@ void RasterizerVulkan::DrawTexture() {
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
-    UpdateDynamicStates();
+    UpdateDynamicStates(nullptr);
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
@@ -1095,6 +1176,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     const bool use_stencil = regs.clear_surface.S;
     if (!use_color && !use_depth && !use_stencil) {
         return;
+    }
+    if (use_depth) {
+        NoteCameraMotionClear();
     }
 
     std::scoped_lock lock{texture_cache.mutex};
@@ -1338,16 +1422,50 @@ void RasterizerVulkan::DispatchCompute() {
         }
         frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
     };
+    TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
         for (const auto& image : pipeline->SampledImages()) {
-            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id)});
+            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id),
+                               &texture_cache.GetSampler(image.sampler)});
         }
         frame_dump.NoteDispatchSampled(pipeline->ShaderHash(), sampled);
+    }
+    if (frame_dump.CapturingBuffers()) {
+        FrameDumpBuffers(true, std::array{pipeline->ShaderHash()});
     }
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
+    // writes to the next render pass.
+    const auto record_read_barrier = [this] {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   0, READ_BARRIER);
+        });
+        scheduler.NoteComputeWrites();
+    };
+    if (frame_dump.CapturingBuffers()) {
+        std::optional<std::array<u32, 3>> indirect_grid;
+        if (indirect_address) {
+            indirect_grid = std::array{gpu_memory->Read<u32>(*indirect_address),
+                                       gpu_memory->Read<u32>(*indirect_address + 4),
+                                       gpu_memory->Read<u32>(*indirect_address + 8)};
+        }
+        frame_dump.NoteLaunch(pipeline->ShaderHash(),
+                              {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
+                              {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+                              indirect_address, indirect_grid);
+    }
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -1355,6 +1473,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
@@ -1374,14 +1493,7 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    static constexpr VkMemoryBarrier READ_BARRIER{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-    };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    record_read_barrier();
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
@@ -1425,6 +1537,13 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+    // The split's front reads reports with MME DMA: it flushes the pages left pending here.
+    if (VideoCommon::GpuSplit::Get().Active()) {
+        if (const auto device = gpu_memory ? gpu_memory->GpuToCpuAddress(gpu_addr) : std::nullopt;
+            device && query_cache.IsRegionGpuModified(*device, 16)) {
+            Tegra::Nx2MarkReportPages(*device, 16);
+        }
+    }
 }
 
 void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
@@ -1439,7 +1558,9 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
+    // the longer DeferFlush interval (#161).
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
 }
@@ -1461,6 +1582,12 @@ VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenC
 
 void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
+}
+
+void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+    gpu.InvalidateGPUCache();
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.Nx2FlushListPages(pages);
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
@@ -1488,7 +1615,11 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
+    // The split's front asks this before each macro DMA read, and the back holds the buffer
+    // cache's lock through each draw: pages the GPU never wrote need no look under it.
+    if (True(which & VideoCommon::CacheType::BufferCache) &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
@@ -1504,13 +1635,24 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
     return false;
 }
 
+bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
+    return query_cache.IsRegionGpuModified(addr, size);
+}
+
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking, and skips later reads in this area,
+        // even through another device alias of those pages. The buffer cache arms only pages it
+        // doesn't count as armed, so it must forget the whole area.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                     texture_area->end_address - texture_area->start_address);
+        return *texture_area;
     }
     if (buffer_cache.FlushesOnCpuRead()) {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -1559,7 +1701,17 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
-    {
+    // The GPU's own cached writes (constant buffer data, every draw): most land where no image,
+    // query or shader was ever registered, which page_filter tells without the caches' locks.
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        for (const auto& [addr, size] : sequences) {
+            if (filter.Any(addr, size)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (any(texture_cache.page_filter)) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);
@@ -1571,10 +1723,14 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             buffer_cache.WriteMemory(addr, size);
         }
     }
-    for (const auto& [addr, size] : sequences) {
-        query_cache.InvalidateRegion(addr, size);
+    if (any(query_cache.page_filter)) {
+        for (const auto& [addr, size] : sequences) {
+            query_cache.InvalidateRegion(addr, size);
+        }
     }
-    pipeline_cache.InvalidateRegions(sequences);
+    if (any(pipeline_cache.page_filter)) {
+        pipeline_cache.InvalidateRegions(sequences);
+    }
 }
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
@@ -1591,6 +1747,28 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     }
     pipeline_cache.InvalidateRegion(addr, size);
     return false;
+}
+
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
+    // on its pages (WriteMemory), which would write over the next collected write.
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            texture_cache.WriteMemory(addr, size);
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            buffer_cache.WriteMemory(addr, size);
+        }
+    }
+    pipeline_cache.InvalidateRegions(ranges);
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
@@ -1669,6 +1847,38 @@ void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
 }
 
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    // Shared with the callback: it may run after a timed-out wait returned.
+    struct WaitState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto state = std::make_shared<WaitState>();
+    fence_manager.SyncOperation([state] {
+        std::scoped_lock lock{state->mutex};
+        state->written = true;
+        state->cv.notify_all();
+    });
+    fence_manager.SignalFence([] {});
+    scheduler.FlushDeferred();
+    std::unique_lock lock{state->mutex};
+    if (!state->cv.wait_for(lock, std::chrono::seconds{2}, [&state] { return state->written; })) {
+        static std::atomic<bool> warned{};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Query results at {:#x} not written after 2 s: reading them as they are",
+                        addr);
+        }
+    }
+}
+
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
     if (Settings::IsGPULevelHigh()) {
@@ -1698,20 +1908,23 @@ void RasterizerVulkan::WaitForIdle() {
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetEvent(event, flags);
-        cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
+    scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
+        // Later work waits for the earlier work and sees its writes.
+        static constexpr VkMemoryBarrier WFI_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(flags, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
     });
     fence_manager.SignalOrdering();
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    if (device.IsMoltenVK()) {
-        scheduler.DeferFragmentBarrier();
-        return;
-    }
-    // We already put barriers when a render pass finishes
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
+    // ended ~5,900 render passes a second here.
+    scheduler.DeferFragmentBarrier();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
@@ -1801,6 +2014,66 @@ void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
               static_cast<u32>(regs.render_enable_override));
 }
 
+void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes) {
+    // Guest CPU writes into GPU-written buffer memory are collected, and applied to the host
+    // buffers only at the next fence or cache invalidation. A hit here reads the older bytes.
+    static const bool enabled = std::getenv("EDEN_NX2_PENDING_WRITE_TRACE") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static constexpr u64 max_lines = 100000;
+    static u64 lines{};
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
+                                                 const auto& binding, u32 bound_size,
+                                                 const auto*, u32) {
+        if (lines > max_lines || !gpu.HasPendingCPUWrites(binding.device_addr, bound_size)) {
+            return;
+        }
+        if (++lines > max_lines) {
+            LOG_INFO(HW_GPU, "Pending write trace stopped after {} lines", max_lines);
+            return;
+        }
+        const size_t program = compute ? 0 : stage + 1;
+        LOG_INFO(HW_GPU,
+                 "Pending CPU write frame={} {} shader={:016x} stage={} {}[{}]{} addr={:#x} "
+                 "device={:#x} size={:#x}",
+                 render_trace_frame, compute ? "dispatch" : "draw",
+                 program < shader_hashes.size() ? shader_hashes[program] : 0, stage,
+                 storage ? "ssbo" : "cbuf", index, written ? " written" : "", binding.gpu_addr,
+                 binding.device_addr, bound_size);
+    });
+}
+
+bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
+    static constexpr u32 BUFFER_CAP = 4U << 20;
+    std::vector<FrameDump::BoundBuffer> buffers;
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
+                                                 const auto& binding, u32 bound_size,
+                                                 const auto* host, u32 host_offset) {
+        const u32 size = std::min(bound_size, BUFFER_CAP);
+        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+        FrameDump::BoundBuffer& buffer = buffers.emplace_back(FrameDump::BoundBuffer{
+            .stage = stage,
+            .storage = storage,
+            .index = index,
+            .written = written,
+            .gpu_addr = binding.gpu_addr,
+            .device_addr = binding.device_addr,
+            .bound_size = bound_size,
+            .size = size,
+            .gpu_modified = gpu_modified,
+            .host = host ? host->Handle() : VK_NULL_HANDLE,
+            .host_offset = host_offset,
+            .guest = {},
+        });
+        if (!gpu_modified || !host) {
+            buffer.guest.resize(size);
+            device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
+        }
+    });
+    return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
+}
+
 void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
     std::array<ImageView*, VideoCommon::NUM_RT> colors{};
     const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
@@ -1817,11 +2090,28 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void RasterizerVulkan::TickFrame() {
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
-            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->id);
+            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
+                           capture->id);
         }
         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
             pipeline_cache.RefreshDebugRejections(change->unrejected);
             VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
+        }
+        while (const auto read = VideoCore::Nx2Debug::TakeGpuRead()) {
+            std::vector<Tegra::MemoryManager*> spaces;
+            if (gpu_memory != nullptr) {
+                spaces.push_back(gpu_memory);
+            }
+            {
+                std::scoped_lock lock{config_mutex};
+                for (const auto& [id, space] : address_spaces) {
+                    if (space.gpu_memory != gpu_memory) {
+                        spaces.push_back(space.gpu_memory);
+                    }
+                }
+            }
+            VideoCore::Nx2Debug::FinishGpuRead(read->id,
+                                               ReadGpuMemory(spaces, read->gpu_address, read->size));
         }
     }
     frame_dump.TickFrame();
@@ -1917,6 +2207,12 @@ bool RasterizerVulkan::UsesNvidiaDlss() const {
     return texture_cache_runtime.UsesNvidiaDlss();
 }
 
+bool RasterizerVulkan::EmulatesNativeTensorPrograms() const {
+    // Mesa's Intel driver takes minutes to compile an emulated network (Ocarina of Time's has 768
+    // matrix multiplies) and then runs it at about 8 FPS. The upscale stand-in draws instead.
+    return device.GetDriverID() != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+}
+
 bool RasterizerVulkan::SupportsGameDlssNetwork() const {
     // Compute pipelines are created 32 threads wide where the device can be told to.
     return device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
@@ -1935,6 +2231,250 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
                                           use_history);
+}
+
+// NVIDIA DLSS in place of Ocarina of Time's anti-aliasing (ocarina_upscale.h). The game draws no
+// jitter and no motion vectors, so the host offsets the viewport of every draw of the scene's
+// camera at the scene's size by a sub-pixel jitter (the depth prepass and the colour pass alike,
+// or the colour pass's equal depth test fails), and DLSS gets motion vectors from the camera
+// alone: each pixel's depth taken back through this frame's camera and forward through the last
+// one's.
+void RasterizerVulkan::NoteCameraMotionDraw() {
+    namespace Ocarina = VideoCommon::OcarinaUpscale;
+    auto& motion = camera_motion;
+    if (!motion.armed) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const GPUVAddr depth = regs.zeta_enable && regs.viewport_scale_offset_enabled &&
+                                   regs.zeta.format == Tegra::DepthFormat::Z32_FLOAT
+                               ? regs.zeta.Address()
+                               : 0;
+    const std::array<u32, 2> depth_size{regs.zeta_size.width, regs.zeta_size.height};
+    // The scene's geometry binds its camera. Full-screen passes on the same depth buffer (the
+    // tonemap among them) don't, and stay where they are.
+    const auto& camera = maxwell3d->state.shader_stages[0].const_buffers[Ocarina::CameraBuffer];
+    const bool has_camera = depth != 0 && camera.enabled && camera.size >= Ocarina::CameraBytes;
+    auto& cached = motion.camera;
+    if (has_camera && camera.address != cached.address) {
+        cached.address = camera.address;
+        cached.perspective = false;
+        if (gpu_memory->IsFullyMappedRange(camera.address, Ocarina::CameraBytes)) {
+            std::array<f32, 16> projection;
+            gpu_memory->ReadBlockUnsafe(camera.address + Ocarina::ProjectionOffset,
+                                        projection.data(), sizeof(projection));
+            cached.perspective = Ocarina::IsPerspective(projection);
+            gpu_memory->ReadBlockUnsafe(camera.address + Ocarina::ViewProjectionOffset,
+                                        cached.view_projection.data(),
+                                        sizeof(cached.view_projection));
+        }
+    }
+    const bool perspective = has_camera && cached.perspective;
+    // Every depth buffer the scene's camera draws at the scene's size, not only the scene's: the
+    // game shades its opaque geometry with an EQUAL test against a copy of the prepass depth, so
+    // both must have the same offset.
+    std::array<f32, 2> jitter{};
+    if (perspective && motion.jitter_active && depth_size == motion.jitter_depth_size) {
+        jitter = motion.jitter;
+    }
+    if (perspective) {
+        CameraMotionScene* scene = nullptr;
+        for (size_t i = 0; i < motion.num_scenes; ++i) {
+            CameraMotionScene& candidate = motion.scenes[i];
+            if (candidate.depth == depth && candidate.depth_info.size.width == depth_size[0] &&
+                candidate.depth_info.size.height == depth_size[1]) {
+                scene = &candidate;
+            }
+        }
+        if (!scene) {
+            // Shadow and effect passes draw smaller depth buffers before the scene's: when the
+            // records are full, a larger buffer takes the smallest one's.
+            const auto area = [](const CameraMotionScene& record) {
+                return u64{record.depth_info.size.width} * record.depth_info.size.height;
+            };
+            if (motion.num_scenes < motion.scenes.size()) {
+                scene = &motion.scenes[motion.num_scenes++];
+            } else if (CameraMotionScene& smallest =
+                           *std::ranges::min_element(motion.scenes, {}, area);
+                       area(smallest) < u64{depth_size[0]} * depth_size[1]) {
+                scene = &smallest;
+            }
+            if (scene) {
+                *scene = CameraMotionScene{};
+                scene->depth = depth;
+                scene->depth_info = VideoCommon::ImageInfo(regs.zeta, regs.zeta_size,
+                                                           regs.anti_alias_samples_mode);
+            }
+        }
+        if (scene) {
+            const bool rescaled = texture_cache.IsRescaling();
+            const float scale = rescaled ? Settings::values.resolution_info.up_factor : 1.0f;
+            scene->camera = camera.address;
+            scene->view_projection = cached.view_projection;
+            scene->viewport = GetViewportState(device, regs, 0, scale);
+            scene->y_sign = device.IsNvViewportSwizzleSupported() &&
+                                    regs.viewport_transform[0].swizzle.y ==
+                                        Maxwell::ViewportSwizzle::NegativeY
+                                ? -1.0f
+                                : 1.0f;
+            scene->depth_minus_one = regs.depth_mode == Maxwell::DepthMode::MinusOneToOne;
+            scene->rescaled = rescaled;
+            scene->jitter = jitter;
+            ++scene->draws;
+        }
+    }
+    if (jitter != motion.applied) {
+        motion.applied = jitter;
+        state_tracker.InvalidateViewports();
+    }
+}
+
+void RasterizerVulkan::NoteCameraMotionClear() {
+    auto& motion = camera_motion;
+    const auto& regs = maxwell3d->regs;
+    if (!motion.armed || !regs.zeta_enable || regs.zeta.Address() != motion.jitter_depth ||
+        std::array<u32, 2>{regs.zeta_size.width, regs.zeta_size.height} !=
+            motion.jitter_depth_size) {
+        return;
+    }
+    ++motion.clears_since_evaluation;
+    if (motion.jitter_ready) {
+        motion.jitter_ready = false;
+        motion.jitter_active = true;
+        return;
+    }
+    // Cleared again with no evaluation since: another clear in the same frame, or the game's
+    // anti-aliasing stopped running (a menu, a load), so its draws mustn't keep the jitter.
+    // Past twice the clears of the last evaluated frame, it missed a frame. Counting clears,
+    // not time, keeps a slow frame's jitter to its end: its opaque pass tests EQUAL against
+    // the jittered prepass depth.
+    const u32 per_frame = motion.clears_per_frame != 0 ? motion.clears_per_frame : 2;
+    if (motion.jitter_active && motion.clears_since_evaluation > 2 * per_frame) {
+        motion.jitter_active = false;
+    }
+}
+
+bool RasterizerVulkan::AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
+                                                     const Tegra::Engines::Fermi2D::Surface& dst) {
+    namespace Ocarina = VideoCommon::OcarinaUpscale;
+    auto& motion = camera_motion;
+    motion.armed = true;
+    // The scene: the depth buffer at the colour's size with the most perspective draws.
+    const CameraMotionScene* scene = nullptr;
+    for (size_t i = 0; i < motion.num_scenes; ++i) {
+        const CameraMotionScene& candidate = motion.scenes[i];
+        if (candidate.draws > 0 && candidate.depth_info.size.width == src.width &&
+            candidate.depth_info.size.height == src.height &&
+            (!scene || candidate.draws > scene->draws)) {
+            scene = &candidate;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto finish = [&](bool done) {
+        motion.num_scenes = 0;
+        // Camera buffers are rewritten each frame, often at the same addresses.
+        motion.camera = {};
+        if (!done) {
+            // The game's own anti-aliasing draws this frame: no jitter, and no history to keep.
+            motion.jitter_active = false;
+            motion.jitter_ready = false;
+            motion.jitter_depth = 0;
+            motion.jitter_depth_size = {};
+            motion.clears_since_evaluation = 0;
+            motion.clears_per_frame = 0;
+            motion.previous_screen.reset();
+        }
+        return done;
+    };
+    const bool paused = VideoCore::NvidiaDlssPaused();
+    if (paused != motion.paused) {
+        motion.paused = paused;
+        LOG_INFO(Render_Vulkan, "Ocarina of Time anti-aliasing: NVIDIA DLSS switched {}",
+                 paused ? "off, the game's own runs" : "on");
+        motion.evaluations = 0; // log the first evaluations again
+    }
+    if (!scene || paused) {
+        return finish(false);
+    }
+    // The scene's viewport must cover the image, so the matrix maps to its pixels.
+    const VkViewport& viewport = scene->viewport;
+    const f32 width = static_cast<f32>(
+        scene->rescaled ? Settings::values.resolution_info.ScaleUp(src.width) : src.width);
+    const f32 height = static_cast<f32>(
+        scene->rescaled ? Settings::values.resolution_info.ScaleUp(src.height) : src.height);
+    if (std::abs(viewport.x) > 0.5f || std::abs(viewport.width - width) > 0.5f ||
+        std::abs(std::min(viewport.y, viewport.y + viewport.height)) > 0.5f ||
+        std::abs(std::abs(viewport.height) - height) > 0.5f) {
+        return finish(false);
+    }
+    // Device depth = offset + scale * NDC z, as the viewport's depth range gives it.
+    const f32 depth_offset = scene->depth_minus_one
+                                 ? (viewport.minDepth + viewport.maxDepth) * 0.5f
+                                 : viewport.minDepth;
+    const f32 depth_scale = scene->depth_minus_one
+                                ? (viewport.maxDepth - viewport.minDepth) * 0.5f
+                                : viewport.maxDepth - viewport.minDepth;
+    const Ocarina::Matrix screen = Ocarina::ScreenMatrix(
+        Ocarina::ViewportMatrix(viewport.x, viewport.y, viewport.width, viewport.height,
+                                scene->y_sign, depth_offset, depth_scale),
+        scene->view_projection);
+    const std::array<u32, 2> size{src.width, src.height};
+    // A gap in the evaluations (a menu, a load) or another scene starts the history again.
+    bool reset = !motion.previous_screen || motion.previous_depth != scene->depth ||
+                 motion.previous_size != size || motion.previous_rescaled != scene->rescaled ||
+                 !motion.last_evaluation ||
+                 now - *motion.last_evaluation > std::chrono::milliseconds{250};
+    std::optional<std::array<f32, 16>> reprojection;
+    if (!reset) {
+        reprojection = Ocarina::Reprojection(*motion.previous_screen, screen);
+    }
+    if (!reprojection) {
+        reset = true;
+        reprojection = std::array<f32, 16>{1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                           0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    }
+    const std::array<f32, 2> jitter = scene->jitter;
+    bool done;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        done = texture_cache.CameraMotionUpscale(
+            dst, src, scene->depth_info, scene->depth,
+            {static_cast<u32>(width), static_cast<u32>(height)}, *reprojection, jitter, reset);
+    }
+    if (motion.evaluations < 4 || (!done && motion.evaluations < 64)) {
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina of Time anti-aliasing: NVIDIA DLSS {} (scene depth {:#x} {}x{}, {} "
+                 "draws, camera {:#x}, jitter {},{}, reset {})",
+                 done ? "applied" : "unavailable; the game's own runs", scene->depth, src.width,
+                 src.height, scene->draws, scene->camera, jitter[0], jitter[1], reset);
+    }
+    ++motion.evaluations;
+    if (!done) {
+        return finish(false);
+    }
+    motion.jittered |= scene->jitter != std::array<f32, 2>{};
+    if (motion.evaluations == 120 && !motion.jittered) {
+        LOG_WARNING(Render_Vulkan, "Ocarina of Time anti-aliasing: the scene's depth buffer at "
+                                   "{:#x} is never cleared, so its draws get no jitter",
+                    scene->depth);
+    }
+    motion.previous_screen = screen;
+    motion.previous_depth = scene->depth;
+    motion.previous_size = size;
+    motion.previous_rescaled = scene->rescaled;
+    motion.last_evaluation = now;
+    if (motion.clears_since_evaluation != 0) {
+        motion.clears_per_frame = motion.clears_since_evaluation;
+    }
+    motion.clears_since_evaluation = 0;
+    // The next frame's jitter, from when its scene depth is cleared; the rest of this frame (its
+    // interface) is drawn without it.
+    motion.jitter_depth = scene->depth;
+    motion.jitter_depth_size = size;
+    motion.jitter = Ocarina::Jitter(++motion.phase);
+    motion.jitter_ready = true;
+    motion.jitter_active = false;
+    return finish(true);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {
@@ -2049,19 +2589,18 @@ void RasterizerVulkan::FlushWork() {
     const bool native = gpu_memory->UsesNativeTiling();
     u32 budget = SubmissionPolicy::DefaultNativeBudget;
     if (native && !android) {
-        static const u32 configured_budget = [] {
+        static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
                 if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
-                    return *parsed;
+                    return parsed;
                 }
                 LOG_WARNING(Render_Vulkan,
-                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}, "
-                            "using {}",
-                            (std::numeric_limits<u32>::max)(), SubmissionPolicy::DefaultNativeBudget);
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            (std::numeric_limits<u32>::max)());
             }
-            return SubmissionPolicy::DefaultNativeBudget;
+            return std::nullopt;
         }();
-        budget = configured_budget;
+        budget = configured_budget.value_or(SubmissionPolicy::DefaultNativeBudget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {
@@ -2154,7 +2693,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-void RasterizerVulkan::UpdateDynamicStates() {
+void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
     auto& regs = maxwell3d->regs;
     auto& flags = maxwell3d->dirty.flags;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
@@ -2226,13 +2765,16 @@ void RasterizerVulkan::UpdateDynamicStates() {
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
-        UpdateBlending(regs);
+        UpdateBlending(regs, pipeline);
     } else if (device.IsExtColorWriteEnableSupported()) {
         UpdateColorWriteEnable(regs);
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
+        // A draw passes the pipeline it looked up: a second lookup was ~2.5% of the back thread.
+        const GraphicsPipeline* const gp =
+            pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
+        if (gp && gp->HasDynamicVertexInput()) {
             UpdateVertexInput(regs);
         }
     }
@@ -2302,7 +2844,7 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
-    const std::array viewport_list{
+    std::array viewport_list{
         GetViewportState(device, regs, 0, scale),  GetViewportState(device, regs, 1, scale),
         GetViewportState(device, regs, 2, scale),  GetViewportState(device, regs, 3, scale),
         GetViewportState(device, regs, 4, scale),  GetViewportState(device, regs, 5, scale),
@@ -2312,6 +2854,14 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         GetViewportState(device, regs, 12, scale), GetViewportState(device, regs, 13, scale),
         GetViewportState(device, regs, 14, scale), GetViewportState(device, regs, 15, scale),
     };
+    // The host's jitter for NVIDIA DLSS (NoteCameraMotionDraw), in host pixels; added after the
+    // scaling so it isn't rounded away.
+    if (camera_motion.applied[0] != 0.0f || camera_motion.applied[1] != 0.0f) {
+        for (VkViewport& viewport : viewport_list) {
+            viewport.x += camera_motion.applied[0];
+            viewport.y += camera_motion.applied[1];
+        }
+    }
     scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {
         const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);
@@ -2862,12 +3412,18 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
 }
 
-void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchBlending()) {
+void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
+                                      const GraphicsPipeline* pipeline) {
+    // The write mask also excludes components the fragment shader doesn't output, so it has to be
+    // recorded again whenever the bound pipeline outputs a different set of components.
+    const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+    const bool color_output_changed = color_output_mask != last_color_output_mask;
+    if (!state_tracker.TouchBlending() && !color_output_changed) {
         return;
     }
 
-    if (state_tracker.TouchColorMask()) {
+    if (state_tracker.TouchColorMask() || color_output_changed) {
+        last_color_output_mask = color_output_mask;
         std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
             const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
@@ -2884,6 +3440,7 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
             if (mask.A) {
                 current |= VK_COLOR_COMPONENT_A_BIT;
             }
+            current &= (color_output_mask >> (index * 4)) & 0xF;
         }
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);

@@ -110,6 +110,8 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    page_filter.h
+    pipeline_cache_policy.h
     native_qmd.h
     native_query_trace.h
     nx2.h
@@ -117,6 +119,9 @@ add_library(video_core STATIC
     nx2_debug_control.cpp
     nx2_debug_control.h
     nx2_profile.h
+    nx2_perf.h
+    nx2_download_trace.h
+    ocarina_upscale.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -127,6 +132,7 @@ add_library(video_core STATIC
     query_cache/query_stream.h
     query_cache/types.h
     query_cache.h
+    query_dma.h
     rasterizer_interface.h
     renderer_base.cpp
     renderer_base.h
@@ -165,7 +171,10 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_clear_layers.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/pipeline_optimization.h
+    renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
     renderer_vulkan/renderer_vulkan.h
@@ -183,6 +192,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
+    renderer_vulkan/vk_camera_motion_pass.cpp
+    renderer_vulkan/vk_camera_motion_pass.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_descriptor_buffer.cpp
@@ -214,6 +225,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
@@ -293,6 +305,8 @@ add_library(video_core STATIC
     textures/decoders.h
     textures/texture.cpp
     textures/texture.h
+    textures/unswizzle_worker.cpp
+    textures/unswizzle_worker.h
     textures/workers.cpp
     textures/workers.h
     transform_feedback.cpp
