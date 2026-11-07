@@ -1,0 +1,65 @@
+name: Import reviewed OoT integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_file:
+        description: Reviewed bundle in .github/integrations
+        type: string
+        default: oot-20261107.bundle
+        required: true
+      expected_commit:
+        description: Exact reviewed integration commit
+        type: string
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: import-oot-nx2
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: nx2
+          fetch-depth: 0
+
+      - name: Verify and merge reviewed source
+        id: integrate
+        shell: bash
+        env:
+          BUNDLE_FILE: ${{ inputs.bundle_file }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$BUNDLE_FILE" =~ ^[a-zA-Z0-9._-]+\.bundle$ ]]
+          [[ "$EXPECTED_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          bundle=".github/integrations/$BUNDLE_FILE"
+          git bundle verify "$bundle"
+          git fetch "$bundle" refs/heads/codex/oot-20261107:refs/remotes/oot-integration/reviewed
+          reviewed=$(git rev-parse refs/remotes/oot-integration/reviewed)
+          test "$reviewed" = "$EXPECTED_COMMIT"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-ff "$reviewed" -m "Merge reviewed OoT fixes and optional features (2026-11-07)"
+          git diff --exit-code "$reviewed" HEAD -- . ':!.github/**'
+          git diff --check HEAD^ HEAD
+          git push origin HEAD:nx2
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Start Windows PGO build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.integrate.outputs.sha }}
+        run: |
+          gh workflow run windows-pgo.yml --repo "$GITHUB_REPOSITORY" --ref nx2 -f source_ref="$SOURCE_SHA"
+          echo "### Reviewed OoT source merged" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source commit: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Windows PGO build requested." >> "$GITHUB_STEP_SUMMARY"
