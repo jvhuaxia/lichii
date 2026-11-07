@@ -1756,9 +1756,19 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.ClaimCpuWrites(ranges);
     }
-    for (const auto& [addr, size] : ranges) {
-        OnCacheInvalidation(addr, size);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            texture_cache.WriteMemory(addr, size);
+        }
     }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            buffer_cache.WriteMemory(addr, size);
+        }
+    }
+    pipeline_cache.InvalidateRegions(ranges);
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
@@ -1775,22 +1785,6 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
-}
-
-void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, size_t>> ranges) {
-    {
-        std::scoped_lock lock{texture_cache.mutex};
-        for (const auto& [addr, size] : ranges) {
-            texture_cache.WriteMemory(addr, size);
-        }
-    }
-    {
-        std::scoped_lock lock{buffer_cache.mutex};
-        for (const auto& [addr, size] : ranges) {
-            buffer_cache.WriteMemory(addr, size);
-        }
-    }
-    pipeline_cache.InvalidateRegions(ranges);
 }
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
