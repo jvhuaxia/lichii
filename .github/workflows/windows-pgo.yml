@@ -92,8 +92,8 @@ jobs:
             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF \
-            -DYUZU_TESTS=OFF \
+            -DBUILD_TESTING=ON \
+            -DYUZU_TESTS=ON \
             -DYUZU_CMD=ON \
             -DYUZU_ROOM=OFF \
             -DYUZU_ROOM_STANDALONE=OFF \
@@ -124,7 +124,7 @@ jobs:
         shell: msys2 {0}
         run: |
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          cmake --build build/release --target yuzu yuzu-cmd tests --parallel
           ccache --show-stats
 
       - name: Save compiler objects
@@ -169,6 +169,16 @@ jobs:
             deps "$dll"
           done
 
+      - name: Run OoT regression tests
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path ./build/release/bin/tests.exe).Path
+          $filter = '[ampere],[shader],[oot_network],[ocarina_upscale],[fe_upscale],[dlss_contract],[starfox_upscale],[core_pinning],[storage_extent],[texture_handles],[cpu_readback],[read_traps],[buffer_ports],[pipeline_cache],[page_filter],[coherence],[nx2_present_pacer],Uniform stream reuse preserves data through mutation and session resets'
+          $process = Start-Process -FilePath $exe -ArgumentList ('"' + $filter + '"') -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput build/oot-tests-stdout.txt -RedirectStandardError build/oot-tests-stderr.txt
+          Get-Content build/oot-tests-stdout.txt
+          Get-Content build/oot-tests-stderr.txt
+          if ($process.ExitCode -ne 0) { throw "OoT regression tests failed: $($process.ExitCode)" }
+
       - name: Smoke test packaged CLI
         shell: pwsh
         run: |
@@ -184,4 +194,13 @@ jobs:
           name: lichii-${{ matrix.platform }}-${{ steps.source.outputs.commit }}
           path: build/release/bin/
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload regression test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-regression-logs-${{ github.run_id }}
+          path: build/oot-tests-*.txt
+          if-no-files-found: ignore
           retention-days: 30
