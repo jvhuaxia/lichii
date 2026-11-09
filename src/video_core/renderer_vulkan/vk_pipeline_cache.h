@@ -118,6 +118,8 @@ struct ComputePipelineCacheEntry {
     u32 rebuilds{};
     /// Rebuild still compiling: dispatches keep using this entry's pipeline until it is ready
     std::unique_ptr<ComputePipelineCacheEntry> pending;
+    /// Whether a dispatch looked it up yet (kept only with EDEN_NX2_STUTTER_TRACE)
+    bool used{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;

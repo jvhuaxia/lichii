@@ -141,12 +141,14 @@ public:
 
 #ifdef _WIN32
     void SetTimerResolutionNs(std::chrono::nanoseconds ns);
-    void CoarseSleep(s64 deadline_ns);
 #endif
 
     struct Event;
 
     void Reset();
+
+    /// Waits on `event` until next_time, sleeping in the OS for most of it.
+    void WaitForEvent(s64 next_time);
 
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
@@ -170,6 +172,9 @@ public:
     std::atomic<bool> wait_set{};
     std::atomic<bool> has_started{};
     bool is_multicore{};
+    /// Logs the timer thread's waits once a second (EDEN_NX2_HOSTTIMING_STATS=1, or the debug
+    /// server's host_timing).
+    std::atomic<bool> host_wait_stats{};
 };
 
 /// Creates a core timing event with the given name and callback.
