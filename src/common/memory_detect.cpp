@@ -28,6 +28,30 @@
 
 #include "common/memory_detect.h"
 
+#ifdef _WIN32
+namespace {
+
+// Windows 10 1809 added this layout. MinGW headers on the PGO runner still stop at
+// PROCESS_MEMORY_COUNTERS_EX, which has no PrivateWorkingSetSize.
+struct MemoryCountersEx2 {
+    DWORD cb;
+    DWORD PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivateUsage;
+    SIZE_T PrivateWorkingSetSize;
+    ULONGLONG SharedCommitUsage;
+};
+
+} // namespace
+#endif
+
 namespace Common {
 
 // Detects the RAM and Swapfile sizes
@@ -81,14 +105,22 @@ const MemoryInfo& GetMemInfo() {
 ProcessMemoryUsage GetProcessMemoryUsage() {
     ProcessMemoryUsage usage{};
 #ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX2 counters{};
+    MemoryCountersEx2 counters{};
     counters.cb = sizeof(counters);
     if (GetProcessMemoryInfo(GetCurrentProcess(),
                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                             sizeof(counters))) {
+                             counters.cb)) {
         usage.commit = counters.PrivateUsage;
         usage.working_set = counters.WorkingSetSize;
         usage.private_working_set = counters.PrivateWorkingSetSize;
+    } else {
+        PROCESS_MEMORY_COUNTERS_EX basic{};
+        basic.cb = sizeof(basic);
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&basic), basic.cb)) {
+            usage.commit = basic.PrivateUsage;
+            usage.working_set = basic.WorkingSetSize;
+        }
     }
     PERFORMANCE_INFORMATION performance{};
     performance.cb = sizeof(performance);
