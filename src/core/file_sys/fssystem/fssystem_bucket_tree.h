@@ -342,7 +342,7 @@ public:
         : m_tree(), m_entry(), m_entry_index(-1), m_entry_set_count(), m_entry_set{} {}
     ~Visitor() {
         if (m_entry != nullptr) {
-            ::operator delete(m_entry, m_tree->m_entry_size);
+            ::operator delete(m_entry);
             m_tree = nullptr;
             m_entry = nullptr;
         }
