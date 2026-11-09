@@ -21,7 +21,6 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
-#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -113,6 +112,15 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    native_indirect_uniforms_this_frame.clear();
+    if (const GeometryStats& stats = geometry_stats; frame_tick % 600 == 0 && stats.syncs != 0) {
+        if (Nx2Profile::Enabled() || Nx2Perf::Verify()) {
+            LOG_INFO(HW_GPU,
+                     "Geometry upload scans in 600 frames: {} of {} skipped, {} verify mismatches",
+                     stats.syncs_skipped, stats.syncs, stats.verify_mismatches);
+        }
+        geometry_stats = {};
+    }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -210,14 +218,9 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // structures next to the draw arguments its compute dispatches fill in; the draws then read
     // leftover bytes as vertex counts. Download those bytes first (the CPU's own were subtracted
     // above, so they aren't overwritten).
-    // Only the scheduler's owner may download (it records and submits): unmaps and other writes
-    // reach this from CPU and service threads too, and submitting there raced the GPU thread's
-    // own submissions (crashes in Scheduler::SubmitExecution). Those keep the old behaviour;
-    // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && VideoCommon::GpuSplit::OwnsScheduler() &&
-        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
         static const int forced = [] {
@@ -619,6 +622,39 @@ void BufferCache<P>::UpdateComputeBuffers() {
 }
 
 template <class P>
+u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+    const auto mix_binding = [&](const Binding& binding) {
+        mix(binding.device_addr);
+        mix(binding.size);
+    };
+    if (vertex) {
+        for (const Binding& binding : channel_state->vertex_buffers) {
+            mix_binding(binding);
+        }
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (storage) {
+            mix(channel_state->enabled_storage_buffers[stage]);
+            mix(channel_state->written_storage_buffers[stage]);
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                mix_binding(channel_state->storage_buffers[stage][index]);
+            });
+        }
+        if (texture) {
+            mix(channel_state->enabled_texture_buffers[stage]);
+            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+                const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+                mix_binding(binding);
+                mix(static_cast<u64>(binding.format));
+            });
+        }
+    }
+    return hash;
+}
+
+template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (is_indexed) {
         BindHostIndexBuffer();
@@ -725,8 +761,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             }
         }
     }
-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -816,8 +852,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
         }
     }
-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+    channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_compute_storage_buffers;
@@ -841,8 +877,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     }
     const bool native_pointer = kepler_compute->IsNativeMode();
     channel_state->native_compute_storage_buffers =
-        (channel_state->native_compute_storage_buffers & ~(1U << ssbo_index)) |
-        ((native_pointer ? 1U : 0U) << ssbo_index);
+        (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
+        (u64{native_pointer ? 1U : 0U} << ssbo_index);
     const Binding binding =
         table_pointer && holder == 0
             ? NULL_BINDING
@@ -878,9 +914,6 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             break;
         }
         case Settings::NativeComputeWriteMark::Full:
-            break;
-        case Settings::NativeComputeWriteMark::Cap64K:
-            mark = std::min<u64>(binding.size, 64_KiB);
             break;
         }
     }
@@ -1189,7 +1222,8 @@ void BufferCache<P>::BindHostIndexBuffer() {
         }
     }
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        SynchronizeGeometryBuffer(NUM_VERTEX_BUFFERS, channel_state->index_buffer.buffer_id,
+                                  channel_state->index_buffer.device_addr, size);
     } else {
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
@@ -1306,7 +1340,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeGeometryBuffer(index, binding.buffer_id, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1441,62 +1475,26 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     }();
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
-    // the memory tracker, leaving stale host contents, so check such a bank on every bind: games
-    // rewrite per-draw data between draws, and checking once per frame left it stale for a frame
-    // now and then (white flashes in Ocarina of Time, Eglantine 031e07436c).
+    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
-        !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
+        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
+        native_indirect_uniforms_this_frame.insert(device_addr).second) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
                device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
-        const u64 check_size = (std::min<u64>)(mapped_size, size);
-        // Banks slide through larger buffers, a new address per draw: compare each page with
-        // its last contents and mark only the pages that changed.
-        if (native_indirect_page_snapshots.size() >= 16384) {
-            native_indirect_page_snapshots.clear();
-        }
-        const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-        const DAddr end = device_addr + check_size;
-        for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
-            const u8* const guest = device_memory.template GetPointer<u8>(page);
-            if (guest == nullptr) {
-                continue;
-            }
-            auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-            const bool same =
-                !inserted && std::memcmp(it->second.data(), guest, Core::DEVICE_PAGESIZE) == 0;
-            // EDEN_NX2_MME_DMA_STATS: how many checked pages had changed.
-            if (static const bool stats = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
-                stats) {
-                static std::array<u64, 3> counts{};
-                static std::array<u64, 4> changed_state{};
-                ++counts[same ? 0 : (inserted ? 1 : 2)];
-                if (!same && !inserted) {
-                    // Did the tracker already know (CPU-modified), or was the page clean, and
-                    // was it GPU-modified?
-                    const bool known =
-                        memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE);
-                    const bool gpu =
-                        memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE);
-                    ++changed_state[(known ? 1 : 0) | (gpu ? 2 : 0)];
-                }
-                if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
-                    LOG_INFO(HW_GPU,
-                             "Native bank pages checked: same {}, new {}, changed {} (tracker "
-                             "clean {}, CPU-modified {}, GPU {}, both {})",
-                             counts[0], counts[1], counts[2], changed_state[0],
-                             changed_state[1], changed_state[2], changed_state[3]);
-                }
-            }
-            if (same) {
-                continue;
-            }
-            std::memcpy(it->second.data(), guest, Core::DEVICE_PAGESIZE);
-            memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
+        const u64 upload_size = (std::min<u64>)(mapped_size, size);
+        if (upload_size != 0) {
+            std::array<BufferCopy, 1> copies{BufferCopy{
+                .src_offset = 0,
+                .dst_offset = buffer.Offset(device_addr),
+                .size = upload_size,
+            }};
+            UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
@@ -1927,6 +1925,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
+            ++buffer_deletions;
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
@@ -2262,8 +2261,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
 }
 
 template <class P>
-auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync)
-    -> Nx2ListRead {
+auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                     u64* pending_tick) -> Nx2ListRead {
     if constexpr (IS_OPENGL) {
         return Nx2ListRead::Unknown;
     } else {
@@ -2312,6 +2311,10 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             }
             tick = entry.copy_tick;
             writes = entry.copy_writes;
+            if (pending_tick != nullptr) {
+                *pending_tick = tick;
+                return Nx2ListRead::Pending;
+            }
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
         runtime.WaitSubmittedTick(tick);
@@ -2686,6 +2689,32 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
 }
 
 template <class P>
+void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr,
+                                               u32 size) {
+    Buffer& buffer = slot_buffers[buffer_id];
+    // The deletion count keeps a freed and reused buffer id from passing for the scanned one.
+    GeometrySync& sync = geometry_syncs[slot];
+    ++geometry_stats.syncs;
+    if (memory_tracker.IsSynchronized(slot) && sync.buffer_id == buffer_id &&
+        sync.device_addr == device_addr && sync.size == size &&
+        sync.deletions == buffer_deletions) {
+        ++geometry_stats.syncs_skipped;
+        if (Nx2Perf::Verify() && !SynchronizeBuffer(buffer, device_addr, size)) {
+            ++geometry_stats.verify_mismatches;
+        }
+        return;
+    }
+    SynchronizeBuffer(buffer, device_addr, size);
+    sync = GeometrySync{
+        .buffer_id = buffer_id,
+        .device_addr = device_addr,
+        .size = size,
+        .deletions = buffer_deletions,
+    };
+    memory_tracker.WatchSynchronized(slot, device_addr, size);
+}
+
+template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
@@ -2915,6 +2944,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    ++buffer_deletions;
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

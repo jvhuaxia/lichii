@@ -249,10 +249,11 @@ public:
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
-                           : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS |
-                                              VK_SHADER_STAGE_TASK_BIT_EXT |
-                                              VK_SHADER_STAGE_MESH_BIT_EXT
-                                        : VK_SHADER_STAGE_ALL_GRAPHICS)),
+                : mesh_emulation
+                    ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
+                    : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                       VK_SHADER_STAGE_MESH_BIT_EXT
+                                 : VK_SHADER_STAGE_ALL_GRAPHICS)),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
@@ -268,8 +269,37 @@ public:
         });
     }
 
+    /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
+    /// (its bindings carry VK_SHADER_STAGE_COMPUTE_BIT and so does the push constant range).
+    void EnableMeshEmulation() noexcept {
+        mesh_emulation = true;
+    }
+
+    /// Mesh emulation: the output storage buffer the compute shader writes and the vertex
+    /// shader reads, at an explicit binding (after every program's bindings).
+    void AddMeshEmulationOutput(u32 output_binding) {
+        bindings.push_back({
+            .binding = output_binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        });
+        entries.push_back({
+            .dstBinding = output_binding,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .offset = offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        binding = (std::max)(binding, output_binding + 1);
+        ++num_descriptors;
+        offset += sizeof(DescriptorUpdateEntry);
+    }
+
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
-        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
 
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
@@ -309,6 +339,7 @@ private:
     const Device* device{};
     bool is_compute{};
     bool uses_mesh{};
+    bool mesh_emulation{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};
@@ -356,22 +387,6 @@ public:
     std::array<f32, 4> words{};
 };
 
-/// Whether a depth-compare sample of image_view is undefined and its handle garbage: its format
-/// has no depth comparison on this device (what the sample returns then differs between vendors)
-/// and it is an integer or block-compressed color texture, or its handle was read from memory (a
-/// handle program). A single-channel color texture with a cbuf handle may be one a game compares
-/// on purpose, and keeps its view.
-[[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
-    if (image_view.SupportsDepthComparison()) {
-        return false;
-    }
-    const VideoCore::Surface::PixelFormat format{image_view.format};
-    return read_from_memory || VideoCore::Surface::IsPixelFormatInteger(format) ||
-           VideoCore::Surface::IsPixelFormatASTC(format) ||
-           VideoCore::Surface::IsPixelFormatBCn(format) ||
-           VideoCore::Surface::IsPixelFormatETC2(format);
-}
-
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
@@ -384,13 +399,8 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            VideoCommon::ImageViewId image_view_id{(views++)->id};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
-            if (desc.is_depth && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
-                IsUncomparable(texture_cache.GetImageView(image_view_id),
-                               desc.handle_program != ~0U)) {
-                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
-            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {

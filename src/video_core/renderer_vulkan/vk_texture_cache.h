@@ -15,7 +15,6 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
-#include "video_core/renderer_vulkan/vk_camera_motion_pass.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
@@ -118,6 +117,10 @@ public:
         return memory_allocator.MemoryPressureEvents();
     }
 
+    u32 FailedImages() const noexcept {
+        return memory_allocator.FailedImages();
+    }
+
     void LogMemoryStatistics() const;
 
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
@@ -147,16 +150,6 @@ public:
 
     /// True while TemporalUpscale would use NVIDIA DLSS (on, Streamline running, not failed).
     [[nodiscard]] bool UsesNvidiaDlss() const;
-
-    /// NVIDIA DLSS on input_color (tonemapped, render_size on the host) into dst at the same size,
-    /// for a game that renders no jitter and no motion vectors (Ocarina of Time): the host jittered
-    /// the scene's draws, and the motion comes from the depth (standard, not reversed) through
-    /// reprojection, a column-major matrix from (pixel x, pixel y, device depth, 1) to the previous
-    /// frame's pixel. False when DLSS can't run; the caller keeps its own anti-aliasing.
-    bool UpscaleWithCameraMotion(Framebuffer* dst_framebuffer, ImageView& input_color,
-                                 ImageView& depth, std::array<u32, 2> render_size,
-                                 const std::array<f32, 16>& reprojection,
-                                 std::array<f32, 2> jitter, bool reset);
 
     /// Records a health check of a game's DLSS network output against its input (both sampled in
     /// the GENERAL layout) and returns an earlier check's result once the GPU has finished it.
@@ -269,10 +262,6 @@ public:
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
                             VkSampler sampler);
-    /// Draws NVIDIA DLSS's output (source_size) into the DLSS output, box-filtered down when it
-    /// is larger, sharpened as the NVIDIA DLSS sharpness setting says; returns it to GENERAL.
-    void DrawDlssOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
-                        VkExtent2D source_size);
 #ifdef EGLANTINE_STREAMLINE
     /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
     /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
@@ -280,12 +269,8 @@ public:
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool reset);
-    /// The NVIDIA DLSS upscaler, created on first use; null when DLSS can't run.
-    StreamlineDlssUpscaler* DlssUpscaler();
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
-    /// UpscaleWithCameraMotion's motion vectors, created on first use.
-    std::unique_ptr<CameraMotionPass> camera_motion_pass;
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next
@@ -494,6 +479,13 @@ public:
 
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
+
+    u32 HostMipLevels() const noexcept;
+
+    /// No memory was left to make it: the texture cache drops it instead of using it.
+    [[nodiscard]] bool OutOfMemory() const noexcept {
+        return !original_image && info.type != VideoCommon::ImageType::Buffer;
+    }
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -858,6 +850,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;

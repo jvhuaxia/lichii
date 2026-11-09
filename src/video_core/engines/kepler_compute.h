@@ -257,16 +257,7 @@ public:
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
-    /// Draws a plain upscale of a rejected tensor program's input in its place.
-    [[nodiscard]] bool UpscaleInsteadOfNativeProgram();
-    /// NVIDIA DLSS in place of Ocarina of Time's anti-aliasing (ocarina_upscale.h), when the
-    /// setting is on: true when it replaced this dispatch (the network's last pass).
-    bool ProcessOcarinaUpscale(u64 program_id, u64 shader_hash);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
-
-    /// Whether the matrix multiplies (tensor-core instructions) of native compute programs are
-    /// emulated; rejected ones get UpscaleInsteadOfNativeProgram.
-    [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -281,6 +272,7 @@ public:
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
@@ -300,6 +292,8 @@ private:
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
+    std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+    void RememberNativeUpscaleInput();
 
     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
     /// the game's own network output is shown instead of the replacement upscale.
@@ -329,17 +323,25 @@ private:
         VideoCore::GameDlssStatus status{};
     } dlss_chain;
 
+    /// Ocarina of Time's movie network: a pass that reads one colour image and stores none
+    /// retains its input here; the pass that stores an image upscaling it is replaced by a plain
+    /// copy (the network's matrix passes cost tens of milliseconds per frame). Cleared after the
+    /// copy.
+    std::optional<Texture::TICEntry> native_upscale_input;
+    /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
+    /// non-network pass cannot silence the engine forever).
+    u32 network_skip_remaining{};
+    /// Set when the replacement copy fails, so the full network runs from then on.
+    bool native_upscale_disabled{};
+
     /// Motion vectors and depth of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first
     /// pass (run earlier in the frame than the network pass the stand-in replaces), with the input
     /// colour image and camera jitter they go with.
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     std::optional<Texture::TICEntry> dlss_depth;
-    std::array<f32, 2> dlss_jitter{};
     u32 dlss_contract_trace_count{};
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
-    /// The tonemapped frame Ocarina of Time's anti-aliasing reads (ProcessOcarinaUpscale).
-    std::optional<Texture::TICEntry> ocarina_input;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

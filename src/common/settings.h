@@ -202,6 +202,9 @@ struct Values {
     Setting<bool, false> dump_audio_commands{
                                              linkage, false, "dump_audio_commands", Category::Audio, Specialization::Default, false};
 
+    Setting<u16, true> microphone_volume{linkage, 100, 0, 200, "microphone_volume",
+                                        Category::Controls};
+
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
     SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
@@ -395,19 +398,19 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
+    // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    SwitchableSetting<u16, true> frame_rate_limit{linkage,
+                                                  60,
+                                                  30,
+                                                  240,
+                                                  "nx2_frame_rate_limit",
+                                                  Category::Renderer,
+                                                  Specialization::Scalar,
+                                                  true,
+                                                  false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
-    // RCAS on NVIDIA DLSS's image, in stops x 100 like fsr_sharpening_slider: 200 (0%) is off.
-    SwitchableSetting<int, true> nvidia_dlss_sharpening{linkage,
-                                                        200,
-                                                        0,
-                                                        200,
-                                                        "nvidia_dlss_sharpening",
-                                                        Category::Renderer,
-                                                        Specialization::Scalar |
-                                                            Specialization::Percentage,
-                                                        true,
-                                                        true};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -580,8 +583,7 @@ struct Values {
     // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
     // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
     // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
-    // unknown). Full: the whole binding (the behaviour before the store extent). Cap64K: at most
-    // 64 KiB.
+    // unknown). Full: the whole binding (the behaviour before the store extent).
     SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
         linkage,
         NativeComputeWriteMark::Auto,
@@ -647,6 +649,37 @@ struct Values {
     SwitchableSetting<bool> use_vulkan_driver_pipeline_cache{
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
+
+    SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
+                                                           NativeAsyncDraws::Wait,
+                                                           "native_async_draws",
+                                                           Category::RendererAdvanced,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+
+    SwitchableSetting<u32, true> native_pipeline_wait_ms{linkage,
+                                                         8,
+                                                         1,
+                                                         100,
+                                                         "native_pipeline_wait_ms",
+                                                         Category::RendererAdvanced,
+                                                         Specialization::Countable,
+                                                         true,
+                                                         true};
+
+    // Precache shaders before the game starts: the compute programs in the game files and the
+    // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
+    // driver's cache holds them before the game first uses them.
+    // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
+    // asks, as Off.
+    SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
+                                                        PrecacheShaders::Off,
+                                                        "precache_shaders",
+                                                        Category::RendererAdvanced,
+                                                        Specialization::Default,
+                                                        true,
+                                                        true};
 
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
@@ -743,7 +776,7 @@ struct Values {
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
 
-    SwitchableSetting<bool> pin_gpu_threads{linkage, false, "pin_gpu_threads",
+    SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
                                             Category::RendererHacks};
 
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,

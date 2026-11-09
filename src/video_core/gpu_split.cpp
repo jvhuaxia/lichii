@@ -27,6 +27,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -118,61 +119,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
+    ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");
-}
-
-namespace {
-constexpr u64 PageShift = 12;
-
-// The key of a 64-byte block: its device address, or its GPU address in `space` while unmapped.
-template <typename Func>
-void ForEachBlockKey(const void* space, u64 begin, u64 end, u64 block_shift, Func&& func) {
-    const auto* memory_manager = static_cast<const Tegra::MemoryManager*>(space);
-    const u64 per_page = u64{1} << (PageShift - block_shift);
-    u64 block = begin >> block_shift;
-    const u64 last = (end - 1) >> block_shift;
-    while (block <= last) {
-        const u64 page = block >> (PageShift - block_shift);
-        const u64 page_last = std::min(last, (page + 1) * per_page - 1);
-        const auto device = memory_manager->GpuToCpuAddress(page << PageShift);
-        for (; block <= page_last; ++block) {
-            const u64 offset = block & (per_page - 1);
-            func(device ? ((*device >> block_shift) | offset) & ~(u64{1} << 63)
-                        : (block ^ (static_cast<u64>(reinterpret_cast<uintptr_t>(space)) << 40)) |
-                              (u64{1} << 63));
-        }
-    }
-}
-} // Anonymous namespace
-
-void GpuSplit::NoteBlocks(std::unordered_map<u64, u64>& blocks, const void* space, u64 begin,
-                          u64 end) {
-    ForEachBlockKey(space, begin, end, WriteBlockShift,
-                    [&](u64 key) { blocks[key] = write_position; });
-}
-
-u64 GpuSplit::BlocksPosition(const std::unordered_map<u64, u64>& blocks, const void* space,
-                             u64 begin, u64 end) const {
-    u64 position = 0;
-    ForEachBlockKey(space, begin, end, WriteBlockShift, [&](u64 key) {
-        if (const auto it = blocks.find(key); it != blocks.end()) {
-            position = std::max(position, it->second);
-        }
-    });
-    return position;
-}
-
-u64 GpuSplit::TrackedWritePosition(const void* space, u64 begin, u64 end) {
-    if (end <= begin || write_blocks.empty() || latest_block_write <= Consumed()) {
-        return 0;
-    }
-    if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
-        return latest_block_write;
-    }
-    return BlocksPosition(write_blocks, space, begin, end);
 }
 
 void GpuSplit::Stop() {
@@ -191,11 +142,6 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
-    last_barrier_position = 0;
-    write_blocks.clear();
-    opaque_blocks.clear();
-    latest_block_write = 0;
-    latest_opaque_write = 0;
     last_sync_position = 0;
     published_local = 0;
     consumed_cache = 0;
@@ -257,27 +203,18 @@ void GpuSplit::Publish() {
 
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position && BackQuiet()) {
+    if (consumed_cache == write_position) {
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
-    // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
-    // from its idle hook afterwards, and the caller may use the scheduler once this returns.
-    bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
-            if (BackQuiet()) {
-                publish_every = 8;
-                Nx2Profile::AddDrain(site, start);
-                return;
-            }
-            if (!hook_asked) {
-                RequestIdleHook();
-                hook_asked = true;
-            }
+            publish_every = 8;
+            Nx2Profile::AddDrain(site, start);
+            return;
         }
         Backoff(spins, write_position);
     }
@@ -431,6 +368,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             }
             return (head & HasSegment) != 0 ? 2 : 1;
         }
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -452,6 +392,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -462,6 +405,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
@@ -497,16 +443,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
-            if (available == read_position) {
+            if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                // The front may already see everything consumed: Drain() waits for back_quiet
-                // too, so the deferred submit can't overlap whatever the front does next.
-                if (!back_quiet.load(std::memory_order_relaxed)) {
-                    if (idle_hook != nullptr) {
-                        idle_hook(idle_argument);
-                    }
-                    back_quiet.store(true, std::memory_order_release);
-                }
+                idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -525,8 +464,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
-        // Before any entry runs, so a front that sees these entries consumed also sees this.
-        back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size =

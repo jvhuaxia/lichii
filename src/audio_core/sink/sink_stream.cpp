@@ -14,10 +14,10 @@
 
 #include "audio_core/audio_core.h"
 #include "audio_core/common/common.h"
+#include "audio_core/sink/input_processing.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/fixed_point.h"
-#include "common/nx2_movie_clock.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -102,23 +102,21 @@ bool SinkStream::TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples
     return true;
 }
 
+/// Return a guest-sized capture buffer with gain, channel conversion, and underrun padding.
 std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
-    auto samples{samples_buffer.Pop(num_samples)};
+    const auto frames = num_samples / system_channels;
+    const auto captured = samples_buffer.Pop(frames * device_channels);
+    const auto volume{system_volume * device_volume};
+    return ConvertInputSamples(captured, num_samples, device_channels, system_channels, volume);
+}
 
-    // TODO: Up-mix to 6 channels if the game expects it.
-    // For audio input this is unlikely to ever be the case though.
-
-    // Incoming mic volume seems to always be very quiet, so multiply by an additional 8 here.
-    // TODO: Play with this and find something that works better.
-    constexpr s32 min = (std::numeric_limits<s16>::min)();
-    constexpr s32 max = (std::numeric_limits<s16>::max)();
-    auto volume{system_volume * device_volume * 8};
-    for (u32 i = 0; i < samples.size(); i++)
-        samples[i] = s16(std::clamp(s32(f32(samples[i]) * volume), min, max));
-
-    if (samples.size() < num_samples)
-        samples.resize(num_samples, 0);
-    return samples;
+/// Consume fresh input without inventing frames during capture underruns.
+std::vector<s16> SinkStream::DrainInputSamples(u64 max_frames) {
+    const auto captured = samples_buffer.Pop(max_frames * device_channels);
+    const auto frames = captured.size() / device_channels;
+    const auto volume = system_volume * device_volume;
+    return ConvertInputSamples(captured, frames * system_channels, device_channels, system_channels,
+                               volume);
 }
 
 void SinkStream::ClearQueue() {
@@ -133,7 +131,15 @@ void SinkStream::ClearQueue() {
     playing_buffer.consumed = true;
 }
 
+/// Update a preview peak or queue guest capture; previews also run while emulation is paused.
 void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t num_frames) {
+    if (input_preview) {
+        const auto peak = InputPeak(input_buffer, input_preview_gain.load());
+        auto previous = input_peak.load();
+        while (previous < peak && !input_peak.compare_exchange_weak(previous, peak)) {
+        }
+        return;
+    }
     const std::size_t num_channels = GetDeviceChannels();
     const std::size_t frame_size = num_channels;
     const std::size_t frame_size_bytes = frame_size * sizeof(s16);
@@ -243,13 +249,6 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
-
-    if (type == StreamType::Render && Common::Nx2MovieClock::Enabled()) {
-        auto& clock = Common::Nx2MovieClock::Get();
-        const size_t index = !name.empty() && name.back() == '1' ? 1 : 0;
-        Common::Nx2MovieClock::Add(clock.sink_frames[index], num_frames);
-        Common::Nx2MovieClock::Add(clock.sink_padded[index], num_frames - actual_frames_written);
-    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;

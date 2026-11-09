@@ -520,7 +520,6 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         info.uses_rescaling_uniform = true;
         break;
     case IR::Opcode::TensorMulAdd:
-        info.uses_software_matrix = true;
         info.uses_subgroup_shuffles = true;
         info.uses_fp32_denorms_preserve = true;
         info.uses_subgroup_invocation_id = true;
@@ -844,6 +843,8 @@ void VisitFpModifiers(Info& info, IR::Inst& inst) {
     case IR::Opcode::FPAdd32:
     case IR::Opcode::FPFma32:
     case IR::Opcode::FPMul32:
+    case IR::Opcode::FPMin32:
+    case IR::Opcode::FPMax32:
     case IR::Opcode::FPRoundEven32:
     case IR::Opcode::FPFloor32:
     case IR::Opcode::FPCeil32:

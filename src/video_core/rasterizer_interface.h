@@ -44,6 +44,9 @@ enum class LoadCallbackStage {
     Prepare,
     Build,
     Complete,
+    /// The shader precache running before the game starts (programs built / total).
+    /// Last, so the values of the others stay as frontends that know only those expect.
+    Warm,
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 
@@ -119,11 +122,22 @@ public:
         /// Draws write the page: ask again with `past_sync` once the split's back ran the work
         /// before the last host-level wait (GpuSplit::WaitForSync)
         NeedsSync,
+        /// Only with `pending_tick`: the copy is not done yet, `*pending_tick` is the host GPU
+        /// tick that completes it. Ask again once IsGpuTickDone(*pending_tick).
+        Pending,
     };
+    /// With `pending_tick`, a copy the GPU is still making returns Pending instead of waiting.
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
                                                      [[maybe_unused]] std::span<u8> out,
-                                                     [[maybe_unused]] bool past_sync) {
+                                                     [[maybe_unused]] bool past_sync,
+                                                     [[maybe_unused]] u64* pending_tick = nullptr) {
         return GpuWrittenList::Unknown;
+    }
+
+    /// Whether the host GPU passed `tick`, without waiting. Asks for deferred work to be
+    /// submitted when the tick is not submitted yet, so it completes.
+    virtual bool IsGpuTickDone([[maybe_unused]] u64 tick) {
+        return true;
     }
 
     /// Switch 2: the front flushed this command list page with the split drained.
@@ -156,10 +170,12 @@ public:
                                     [[maybe_unused]] VideoCommon::CacheType which) {}
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-        if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
-            for (const auto& [cpu_addr, size] : sequences) {
-                InvalidateRegion(cpu_addr, size);
-            }
+        // The skip keeps the texture cache: software engine writes reach images only here.
+        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+                               ? VideoCommon::CacheType::TextureCache
+                               : VideoCommon::CacheType::All;
+        for (const auto& [cpu_addr, size] : sequences) {
+            InvalidateRegion(cpu_addr, size, which);
         }
     }
 
@@ -233,23 +249,10 @@ public:
         return false;
     }
 
-    /// NVIDIA DLSS in place of a game's own anti-aliasing of src into dst at the same size
-    /// (Ocarina of Time; ocarina_upscale.h), with jitter and camera motion from the host. False
-    /// when it can't run; the caller retains its native dispatch.
-    [[nodiscard]] virtual bool AccelerateCameraMotionUpscale(
-        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
-        return false;
-    }
-
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {
         return false;
-    }
-
-    /// Whether native tensor programs (matrix multiplies) should be emulated in software here.
-    [[nodiscard]] virtual bool EmulatesNativeTensorPrograms() const {
-        return true;
     }
 
     /// Whether NVIDIA DLSS (the "Use NVIDIA DLSS" setting) would draw a game's DLSS evaluation.
@@ -270,7 +273,7 @@ public:
     }
 
     /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
-    /// this backend cannot bypass it.
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
     [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
         return nullptr;
     }

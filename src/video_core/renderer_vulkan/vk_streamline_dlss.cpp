@@ -51,7 +51,7 @@ sl::DLSSMode ModeFor(VkExtent2D render, VkExtent2D upscale) {
 // Preset K for every mode: NVIDIA's defaults for Performance/Ultra Performance (M, L) draw thin
 // horizontal lines in Fire Emblem at 2x resolution scale. EDEN_NX2_DLSS_PRESET=J|K|L|M picks
 // another model, EDEN_NX2_DLSS_PRESET=default leaves the choice to NVIDIA.
-sl::DLSSPreset Preset(bool prefer_model_m) {
+sl::DLSSPreset Preset() {
     const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
     if (value && value[0] >= 'J' && value[0] <= 'M') {
         return static_cast<sl::DLSSPreset>(static_cast<u32>(sl::DLSSPreset::ePresetJ) +
@@ -60,8 +60,7 @@ sl::DLSSPreset Preset(bool prefer_model_m) {
     if (value && std::string_view{value} == "default") {
         return sl::DLSSPreset::eDefault;
     }
-    // Ocarina of Time's DLAA keeps more detail with M than with K.
-    return prefer_model_m ? sl::DLSSPreset::ePresetM : sl::DLSSPreset::ePresetK;
+    return sl::DLSSPreset::ePresetK;
 }
 
 sl::float4x4 Identity() {
@@ -218,28 +217,21 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    bool reset = in.reset;
-    bool options_changed = false;
-    if (!output_image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
-        in.upscale_size.width != upscale_extent.width ||
-        in.upscale_size.height != upscale_extent.height) {
+    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
+                                in.render_size.height != render_extent.height ||
+                                in.upscale_size.width != upscale_extent.width ||
+                                in.upscale_size.height != upscale_extent.height;
+    const bool options_changed = extent_changed || in.hdr != hdr_input;
+    const bool reset = in.reset || options_changed;
+    if (extent_changed) {
         CreateOutput(in.upscale_size);
         render_extent = in.render_size;
         upscale_extent = in.upscale_size;
-        options_changed = true;
-        reset = true;
     }
-    if (in.hdr != hdr) {
-        hdr = in.hdr;
-        options_changed = true;
-        reset = true;
-    }
+    hdr_input = in.hdr;
 
-    // The game's own setup (Fortune's Weave: render-size motion vectors, reversed depth). Its
-    // colour is linear and goes above 1 with no exposure passed, so by default DLSS gets the HDR
-    // path with its own auto exposure. EDEN_NX2_DLSS_HDR=0 / EDEN_NX2_DLSS_AUTO_EXPOSURE=0 turn
-    // those off.
+    // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
+    // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
     options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
@@ -248,7 +240,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
     options.useAutoExposure =
         in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
-    const sl::DLSSPreset preset = Preset(in.prefer_model_m);
+    const sl::DLSSPreset preset = Preset();
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
     options.balancedPreset = preset;
@@ -256,10 +248,10 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
     if (options_changed) {
-        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}",
+        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                  in.render_size.width, in.render_size.height, in.upscale_size.width,
-                 in.upscale_size.height, static_cast<int>(options.mode),
-                 static_cast<int>(preset));
+                 in.upscale_size.height, static_cast<int>(options.mode), static_cast<int>(preset),
+                 options.colorBuffersHDR == sl::eTrue ? "HDR" : "LDR");
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
