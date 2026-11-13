@@ -201,10 +201,6 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
-    /// Waits until GPU data for the range that is downloading with a fence reaches guest memory
-    /// (GetFlushArea set in_flight).
-    virtual void WaitForPendingDownloads([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
-
     /// Whether reports in the range wait for host query results not yet in guest memory.
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {
