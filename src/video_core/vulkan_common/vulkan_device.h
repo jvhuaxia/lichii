@@ -69,6 +69,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
+    FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL, image_compression_control)    \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
@@ -866,6 +867,13 @@ FN_MAX_LIMIT_LIST
 
     /// Gives back budget taken by TryReserveCustomBorderColorSamplers.
     void ReleaseCustomBorderColorSamplers(size_t count) const;
+
+    /// Returns true if colour images are created without delta colour compression (RADV before
+    /// GFX10: images in the GENERAL layout are never DCC compressed there, and every transfer
+    /// layout round trip decompresses them in full).
+    bool DisablesColorCompression() const {
+        return extensions.image_compression_control;
+    }
 
     /// Returns true if the device supports VK_EXT_color_write_enable.
     bool IsExtColorWriteEnableSupported() const {
