@@ -1,15 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <cstddef>
 #include <optional>
-#include "common/logging.h"
-#include "video_core/stable_sampled_chunks.h"
 
 #include <boost/container/small_vector.hpp>
 
@@ -151,7 +148,7 @@ public:
 
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
-            num_descriptors > device->MaxPushDescriptors() || exceeds_metal_slots) {
+            num_descriptors > device->MaxPushDescriptors()) {
             return false;
         }
         return !device->IsExtDescriptorBufferSupported() ||
@@ -310,22 +307,6 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
-
-        // MoltenVK can't put push descriptors in Metal argument buffers, so each one takes a
-        // direct slot: 31 buffers and 16 samplers per stage, shared with MoltenVK's own auxiliary
-        // buffers and, in vertex shaders, the vertex buffers. Past that the shader fails to
-        // compile or reads unbound buffers, which loses the device.
-        if (device->IsMoltenVK()) {
-            const u32 buffers = Shader::NumDescriptors(info.constant_buffer_descriptors) +
-                                Shader::NumDescriptors(info.storage_buffers_descriptors);
-            const u32 samplers = Shader::NumDescriptors(info.texture_descriptors);
-            const u32 textures = samplers +
-                                 Shader::NumDescriptors(info.texture_buffer_descriptors) +
-                                 Shader::NumDescriptors(info.image_buffer_descriptors) +
-                                 Shader::NumDescriptors(info.image_descriptors);
-            const u32 buffer_slots = (stage & VK_SHADER_STAGE_VERTEX_BIT) != 0 ? 10 : 24;
-            exceeds_metal_slots |= buffers > buffer_slots || samplers > 16 || textures > 31;
-        }
     }
 
 private:
@@ -358,7 +339,6 @@ private:
     bool is_compute{};
     bool uses_mesh{};
     bool mesh_emulation{};
-    bool exceeds_metal_slots{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};
@@ -411,96 +391,41 @@ public:
     std::array<f32, 4> words{};
 };
 
-inline void PushImageDescriptors(
-    TextureCache& texture_cache, GuestDescriptorQueue& guest_descriptor_queue,
-    const Shader::Info& info, RescalingPushConstant& rescaling,
-    const VideoCommon::SamplerId*& samplers, const VideoCommon::ImageViewInOut*& views,
-    VideoCommon::StableSampled::ChunkCache<VkDescriptorImageInfo>* cache = nullptr) {
+/// Whether a depth-compare sample of image_view is undefined and its handle garbage: its format
+/// has no depth comparison on this device (what the sample returns then differs between vendors)
+/// and it is an integer or block-compressed color texture, or its handle was read from memory (a
+/// handle program). A single-channel color texture with a cbuf handle may be one a game compares
+/// on purpose, and keeps its view.
+[[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
+    if (image_view.SupportsDepthComparison()) {
+        return false;
+    }
+    const VideoCore::Surface::PixelFormat format{image_view.format};
+    return read_from_memory || VideoCore::Surface::IsPixelFormatInteger(format) ||
+           VideoCore::Surface::IsPixelFormatASTC(format) ||
+           VideoCore::Surface::IsPixelFormatBCn(format) ||
+           VideoCore::Surface::IsPixelFormatETC2(format);
+}
+
+inline void PushImageDescriptors(TextureCache& texture_cache,
+                                 GuestDescriptorQueue& guest_descriptor_queue,
+                                 const Shader::Info& info, RescalingPushConstant& rescaling,
+                                 const VideoCommon::SamplerId*& samplers,
+                                 const VideoCommon::ImageViewInOut*& views) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
-    namespace Stable = VideoCommon::StableSampled;
-    size_t chunk_count{}, texture_count{};
-    if (cache) {
-        for (const auto& desc : info.texture_descriptors) {
-            texture_count += desc.count;
-            if (desc.count >= Stable::ChunkSize)
-                chunk_count += (desc.count + Stable::ChunkSize - 1) / Stable::ChunkSize;
-        }
-        if (texture_count > Stable::MaxEntries || !cache->Ensure(chunk_count))
-            cache = nullptr;
-    }
-    size_t chunk_index{};
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
-        if (cache && desc.count >= Stable::ChunkSize) {
-            for (u32 base = 0; base < desc.count;
-                 base += static_cast<u32>(Stable::ChunkSize), ++chunk_index) {
-                const size_t count = (std::min)(size_t{desc.count - base}, Stable::ChunkSize);
-                std::array<Stable::U64, Stable::ChunkSize> keys;
-                for (size_t i = 0; i < count; ++i)
-                    keys[i] = (Stable::U64{views[i].id.Value()} << 32) | samplers[i].Value();
-                const auto epoch = Stable::Epoch();
-                const auto* hit =
-                    Stable::FailedValidation().load(std::memory_order_relaxed)
-                        ? nullptr
-                        : cache->Find(chunk_index, epoch, std::span{keys}.first(count));
-                std::array<VkDescriptorImageInfo, Stable::ChunkSize> resolved;
-                bool chunk_rescaled{};
-                // Scaling flags can change on a failed scale attempt without view recreation.
-                for (size_t i = 0; i < count; ++i) {
-                    auto& view = texture_cache.GetImageView(views[i].id);
-                    chunk_rescaled |= texture_cache.IsRescaling(view);
-                    if (!hit || Stable::Validate()) {
-                        auto handle = view.Handle(desc.type);
-                        if (handle == VK_NULL_HANDLE) {
-                            const auto null_handle =
-                                texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)
-                                    .Handle(desc.type);
-                            if (null_handle != VK_NULL_HANDLE)
-                                handle = null_handle;
-                        }
-                        resolved[i] = {
-                            texture_cache.GetSampler(samplers[i]).HandleFor(view, desc.is_depth),
-                            handle, VK_IMAGE_LAYOUT_GENERAL};
-                    }
-                }
-                bool mismatch = false;
-                if (hit && Stable::Validate()) {
-                    for (size_t i = 0; i < count; ++i) {
-                        const auto& a = resolved[i];
-                        const auto& b = hit->values[i];
-                        mismatch |= a.sampler != b.sampler || a.imageView != b.imageView ||
-                                    a.imageLayout != b.imageLayout;
-                    }
-                    if (mismatch) {
-                        Stable::FailedValidation().store(true, std::memory_order_relaxed);
-                        LOG_ERROR(Render_Vulkan, "Stable sampled chunk validation failed; "
-                                                 "disabling cache for this process");
-                        cache->Clear(chunk_index);
-                        hit = nullptr;
-                    }
-                }
-                if (hit) {
-                    guest_descriptor_queue.AddSampledImages(std::span{hit->values}.first(count));
-                } else {
-                    guest_descriptor_queue.AddSampledImages(std::span{resolved}.first(count));
-                    if (!Stable::FailedValidation().load(std::memory_order_relaxed) &&
-                        epoch == Stable::Epoch())
-                        cache->Store(chunk_index, epoch, std::span{keys}.first(count),
-                                     std::span{resolved}.first(count), chunk_rescaled);
-                }
-                is_rescaled |= chunk_rescaled;
-                views += count;
-                samplers += count;
-            }
-            rescaling.PushTexture(is_rescaled);
-            continue;
-        }
         for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            if (desc.is_depth && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
+                IsUncomparable(texture_cache.GetImageView(image_view_id),
+                               desc.handle_program != ~0U)) {
+                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {

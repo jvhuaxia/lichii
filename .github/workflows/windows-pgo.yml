@@ -124,7 +124,7 @@ jobs:
         shell: msys2 {0}
         run: |
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd tests --parallel
+          cmake --build build/release --target lichii lichii-cmd tests --parallel
           ccache --show-stats
 
       - name: Save compiler objects

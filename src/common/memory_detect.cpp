@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _WIN32
@@ -26,6 +25,7 @@
 #include <string_view>
 #endif
 
+#include "common/literals.h"
 #include "common/memory_detect.h"
 
 #ifdef _WIN32
@@ -102,6 +102,25 @@ const MemoryInfo& GetMemInfo() {
     return mem_info;
 }
 
+HostRam GetHostRam() {
+#ifdef _WIN32
+    ULONGLONG kilobytes{};
+    if (GetPhysicallyInstalledSystemMemory(&kilobytes) && kilobytes != 0) {
+        return {kilobytes * 1024, true};
+    }
+#endif
+#ifdef __APPLE__
+    return {GetMemInfo().TotalPhysicalMemory, true};
+#else
+    return {GetMemInfo().TotalPhysicalMemory, false};
+#endif
+}
+
+bool IsBelowSwitch2RamMinimum(HostRam ram) {
+    using namespace Common::Literals;
+    return ram.bytes != 0 && ram.bytes < (ram.installed ? 16_GiB : 12_GiB);
+}
+
 ProcessMemoryUsage GetProcessMemoryUsage() {
     ProcessMemoryUsage usage{};
 #ifdef _WIN32
@@ -143,6 +162,19 @@ ProcessMemoryUsage GetProcessMemoryUsage() {
     }
 #endif
     return usage;
+}
+
+std::optional<u64> GetSystemCommitRoom() {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        const u64 limit = performance.CommitLimit;
+        const u64 committed = performance.CommitTotal;
+        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    }
+#endif
+    return std::nullopt;
 }
 
 } // namespace Common

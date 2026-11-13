@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -32,6 +31,10 @@ namespace Tegra::Control {
 struct ChannelState;
 }
 
+namespace VideoCommon::ShaderCacheV2 {
+class Cache;
+}
+
 namespace VideoCommon {
 
 class GenericEnvironment;
@@ -44,8 +47,8 @@ struct ShaderInfo {
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
-    static constexpr u64 YUZU_PAGEBITS = 14;
-    static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
+    static constexpr u64 LICHII_PAGEBITS = 14;
+    static constexpr u64 LICHII_PAGESIZE = u64(1) << LICHII_PAGEBITS;
 
     static constexpr size_t NUM_PROGRAMS = 6;
 
@@ -113,6 +116,9 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+
+    /// The v2 cache that records the native programs lowered here, while one is open
+    ShaderCacheV2::Cache* shader_cache_v2{};
 
 private:
     friend struct ShaderCacheTestAccess;
