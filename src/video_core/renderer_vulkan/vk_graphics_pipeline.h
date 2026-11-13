@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/stable_sampled_chunks.h"
 #include "video_core/texture_cache/draw_template.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
