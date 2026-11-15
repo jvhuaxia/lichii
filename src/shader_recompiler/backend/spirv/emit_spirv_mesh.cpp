@@ -158,8 +158,10 @@ Id OutputWord(EmitContext& ctx, Id index) {
                              index);
 }
 
-// Mesh emulation (RuntimeInfo::mesh_as_compute): writes this workgroup's block of the output
-// buffer, laid out as MeshEmulationBlockWords describes, instead of the mesh outputs.
+/// Mesh emulation (RuntimeInfo::mesh_as_compute): writes this workgroup's block of the output
+/// buffer, laid out as MeshEmulationBlockWords describes, instead of the mesh outputs. Each
+/// primitive stores PrimitiveVertices() indices (1 for a point, 2 for a line, 3 for a triangle);
+/// slots past the primitive count get the marker the vertex shader culls.
 void ComputeMeshEpilogue(EmitContext& ctx) {
     const MeshInfo& mesh{ctx.mesh_info};
     Barrier(ctx);
@@ -242,8 +244,16 @@ void MeshEpilogue(EmitContext& ctx) {
         return;
     }
     Barrier(ctx);
-    const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
-                              ctx.Const(mesh.max_primitives))};
+    Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                        ctx.Const(mesh.max_primitives))};
+    if (Sirit::ValidId(ctx.mesh_num_workgroups)) {
+        // The grid size is never zero while a workgroup runs, so the count doesn't change; the
+        // read only has to survive the driver's optimisations (see DefineMesh).
+        const Id groups{ctx.OpCompositeExtract(
+            ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.mesh_num_workgroups), 0U)};
+        count = ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, groups, ctx.u32_zero_value),
+                             ctx.u32_zero_value, count);
+    }
     const Id max_vertices{ctx.Const(mesh.max_vertices)};
     // Marker for OpSetMeshOutputsEXT max_vertices, count (PatchMeshInstructions).
     ctx.OpStore(max_vertices, count);
@@ -468,6 +478,9 @@ void EmitMeshEpilogue(EmitContext& ctx) {
     }
 }
 
+/// Builds the vertex shader that draws the emulation's output (see the declaration in
+/// emit_spirv.h). Points also write PointSize, and points and lines past the primitive count are
+/// moved outside the clip volume and culled with a negative ClipDistance.
 std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh, u32 binding,
                                          u32 args_binding, bool convert_depth, float point_size) {
     Sirit::Module module{profile.supported_spirv};

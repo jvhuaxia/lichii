@@ -26,6 +26,10 @@
 #include <string_view>
 #endif
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+
 #include "common/literals.h"
 #include "common/memory_detect.h"
 
@@ -129,15 +133,22 @@ HostRam GetHostRam() {
 #ifdef __linux__
     // udev keeps the firmware's memory devices (SMBIOS type 17) readable without root. This
     // counts memory the GPU reserves, e.g. the Steam Deck's 16 GiB, of which Linux manages 11.5.
-    if (std::ifstream file{"/run/udev/data/+dmi:id"}) {
+        if (std::ifstream file{"/run/udev/data/+dmi:id"}) {
         const std::string data{std::istreambuf_iterator<char>{file}, {}};
-        if (const u64 installed = InstalledRamFromUdev(data); installed != 0) {
-            return {installed, true};
-        }
+        return HostRamFromUdev(data, GetMemInfo().TotalPhysicalMemory);
     }
 #endif
     return {GetMemInfo().TotalPhysicalMemory, false};
 #endif
+}
+
+HostRam HostRamFromUdev(std::string_view data, u64 managed) {
+    // Installed RAM is never less than what the OS manages. A smaller total is a partial one:
+    // udev has no size entry for a device whose size the firmware reports as unknown.
+    if (const u64 installed = InstalledRamFromUdev(data); installed != 0 && installed >= managed) {
+        return {installed, true};
+    }
+    return {managed, false};
 }
 
 u64 InstalledRamFromUdev(std::string_view data) {
@@ -233,6 +244,50 @@ std::optional<u64> GetSystemCommitRoom() {
     }
 #endif
     return std::nullopt;
+}
+
+u64 GetAvailablePhysicalMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX memorystatus;
+    memorystatus.dwLength = sizeof(memorystatus);
+    if (!GlobalMemoryStatusEx(&memorystatus)) {
+        return 0;
+    }
+    return memorystatus.ullAvailPhys;
+#elif defined(__linux__)
+    // MemAvailable counts the page cache the kernel can drop, which sysinfo's freeram doesn't.
+    std::FILE* const file = std::fopen("/proc/meminfo", "r");
+    if (file == nullptr) {
+        return 0;
+    }
+    u64 available_kib = 0;
+    char line[128];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        unsigned long long value = 0;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
+            available_kib = value;
+            break;
+        }
+    }
+    std::fclose(file);
+    return available_kib * 1024;
+#else
+    return 0;
+#endif
+}
+
+bool IsHostLowOnMemory() {
+    using Clock = std::chrono::steady_clock;
+    static std::atomic<Clock::rep> checked_at{};
+    static std::atomic<bool> low{};
+    const Clock::rep now = Clock::now().time_since_epoch().count();
+    const Clock::rep last = checked_at.load(std::memory_order_relaxed);
+    if (last == 0 || now - last >= Clock::duration{std::chrono::seconds{1}}.count()) {
+        checked_at.store(now, std::memory_order_relaxed);
+        low.store(IsLowOnMemory(GetAvailablePhysicalMemory(), GetMemInfo().TotalPhysicalMemory),
+                  std::memory_order_relaxed);
+    }
+    return low.load(std::memory_order_relaxed);
 }
 
 } // namespace Common

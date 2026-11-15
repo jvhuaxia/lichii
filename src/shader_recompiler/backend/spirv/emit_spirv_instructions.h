@@ -43,6 +43,9 @@ void EmitDemoteToHelperInvocation(EmitContext& ctx);
 void EmitBarrier(EmitContext& ctx);
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
 void EmitDeviceMemoryBarrier(EmitContext& ctx);
+void EmitBarrierVoteInit(EmitContext& ctx, u32 offset);
+void EmitBarrierVote(EmitContext& ctx, Id cond, u32 offset, u32 size);
+void EmitVotedBarrier(EmitContext& ctx, u32 offset, u32 size);
 void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
 void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream);
@@ -70,7 +73,6 @@ void EmitSetAttributeIndexed(EmitContext& ctx, Id offset, Id value, Id vertex);
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value);
 Id EmitIsbeRead(EmitContext& ctx, Id address);
-Id EmitIsbeReadOutput(EmitContext& ctx, Id address);
 void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
 void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
 void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
@@ -105,10 +107,10 @@ Id EmitUndefU8(EmitContext& ctx);
 Id EmitUndefU16(EmitContext& ctx);
 Id EmitUndefU32(EmitContext& ctx);
 Id EmitUndefU64(EmitContext& ctx);
-Id EmitLoadGlobalU8(EmitContext& ctx, Id address);
-Id EmitLoadGlobalS8(EmitContext& ctx, Id address);
-Id EmitLoadGlobalU16(EmitContext& ctx, Id address);
-Id EmitLoadGlobalS16(EmitContext& ctx, Id address);
+void EmitLoadGlobalU8(EmitContext& ctx);
+void EmitLoadGlobalS8(EmitContext& ctx);
+void EmitLoadGlobalU16(EmitContext& ctx);
+void EmitLoadGlobalS16(EmitContext& ctx);
 Id EmitLoadGlobal32(EmitContext& ctx, Id address);
 Id EmitLoadGlobal64(EmitContext& ctx, Id address);
 Id EmitLoadGlobal128(EmitContext& ctx, Id address);
@@ -653,8 +655,10 @@ Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
 void PatchCooperativeHmma(std::vector<u32>& code, const CooperativeHmmaTypes& types);
-/// Appends the shared memory of the 16x16x16 or 8x16x16 HMMA path to a program that runs it, and
-/// returns the word where it starts.
+/// Whether a program's K=16 HMMA runs on 16x8x16 cooperative matrices.
+bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program);
+/// Appends the shared memory of the 16x16x16 HMMA path to a program that runs it, and returns the
+/// word where it starts.
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

@@ -42,7 +42,6 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
-#include "video_core/texture_cache/draw_template.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -194,6 +193,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 spill_quiet_frames{};     ///< Frames since the last spill
     u64 spill_collect_tick{};     ///< frame_tick of the first forced collect of this episode + 1
     u32 spill_forced_collects{};  ///< Forced collects in this episode
+    u64 spill_last_collect{};     ///< frame_tick of the last forced collect
     u64 spill_log_bytes{};        ///< Spilled since the last spill log line
     u32 spill_log_collects{};     ///< Forced collects since the last spill log line
     std::chrono::steady_clock::time_point spill_log_time{};
@@ -201,6 +201,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
+    /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
+    /// an unmap or a join. Read and reset by DeleteImage.
+    const char* trace_delete_reason = "other";
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
@@ -304,6 +307,10 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// Whether the handle words and descriptors `memo` was built from still match guest memory.
+    [[nodiscard]] bool TextureMemoStillHolds(const SampledTextureMemo& memo,
+                                             std::span<const GPUVAddr> handle_addresses) const;
+
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
     /// handle_addresses are where the draw reads its texture handles from, in binding order.
@@ -315,26 +322,6 @@ public:
     /// Keeps what FillImageViews and GetSamplerId resolved the draw's textures from.
     void MemoizeTextures(SampledTextureMemo& memo, std::span<const TextureHandleRead> reads,
                          std::span<const ImageViewInOut> views, std::span<const SamplerId> samplers);
-
-    /// What besides its handle words selects the textures a graphics draw samples now.
-    [[nodiscard]] DrawTemplateContext GraphicsTextureContext(u64 owner) const noexcept;
-
-    /// The texture and sampler descriptors the draw's textures were resolved from, for a draw
-    /// template; false when one can't be kept, as for MemoizeTextures.
-    [[nodiscard]] bool KeepTemplateTextures(std::span<const TextureHandleRead> reads,
-                                            std::span<const ImageViewInOut> views,
-                                            std::span<const SamplerId> samplers,
-                                            std::vector<DrawTemplateTexture>& textures);
-
-    /// Prepares the images of the views a draw template gave, as resolving them would; false
-    /// when that deleted images and the views have to be resolved again.
-    [[nodiscard]] bool PrepareTemplateViews(std::span<const ImageViewInOut> views);
-
-    /// Bumped each time the slot's view is deleted: a kept id names the same view while its
-    /// generation holds.
-    [[nodiscard]] u32 ImageViewGeneration(ImageViewId id) const noexcept {
-        return id.index < image_view_generations.size() ? image_view_generations[id.index] : 0;
-    }
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
@@ -531,13 +518,6 @@ private:
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
-    /// Overlaps the GPU drew to after a badly overlapping image, and theirs, oldest first.
-    [[nodiscard]] boost::container::small_vector<ImageId, 8> NewerGpuOverlaps(
-        const ImageBase& image) const;
-
-    /// Copies a GPU-written image back to guest memory and waits for it.
-    void WriteBackImage(Image& image);
-
     void RefreshContents(Image& image, ImageId image_id);
 
     /// Upload data from guest to an image
@@ -667,6 +647,8 @@ private:
     /// none for an unbacked image (too large to back, or over unwritten sparse blocks), what is
     /// bound to its layers for a SparseLayers one.
     u64 ImageMemoryBytes(const Image& image) const;
+    /// The image's allocation size where the runtime reports one, else ImageMemoryBytes.
+    u64 ImageAllocationBytes(const Image& image) const;
 
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();
@@ -721,15 +703,7 @@ private:
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
-    void BumpImageViewGeneration(ImageViewId id) {
-        if (id.index >= image_view_generations.size()) {
-            image_view_generations.resize(id.index + 1);
-        }
-        ++image_view_generations[id.index];
-    }
-
     bool has_deleted_images = false;
-    std::vector<u32> image_view_generations; ///< ImageViewGeneration
     std::vector<ImageId>* prepare_log{}; ///< LogPrepares
     bool prepare_log_dry{};
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
