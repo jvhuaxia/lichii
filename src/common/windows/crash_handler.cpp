@@ -37,6 +37,14 @@ LPTOP_LEVEL_EXCEPTION_FILTER previous_filter{};
 wchar_t dump_path[MAX_PATH]{};
 std::atomic<DWORD> reporting_thread{};
 
+void* CallerAddress() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return _ReturnAddress();
+#else
+    return __builtin_return_address(0);
+#endif
+}
+
 struct CodeAddress {
     char module[64];
     unsigned long long offset;
@@ -158,7 +166,7 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
 // asserts end in abort(), which the C runtime turns into a fail-fast that skips the filter above.
 void OnAbort(int) {
     if (BeginReport()) {
-        ReportFailFast("abort()", _ReturnAddress());
+        ReportFailFast("abort()", CallerAddress());
     }
 }
 
@@ -167,7 +175,7 @@ void OnAbort(int) {
 void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, const wchar_t* file,
                         unsigned int line, std::uintptr_t reserved) {
     if (BeginReport()) {
-        ReportFailFast("CRT invalid-parameter failure", _ReturnAddress());
+        ReportFailFast("CRT invalid-parameter failure", CallerAddress());
     }
     // What the C runtime does without a handler.
     _invoke_watson(expression, function, file, line, reserved);
