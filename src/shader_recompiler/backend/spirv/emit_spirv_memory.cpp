@@ -80,13 +80,14 @@ void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR:
 /// as in The Duskbloods' grass animation): the aligned word through the 32-bit global helper,
 /// then the bits at the address's byte offset. Accesses are naturally aligned, so a 16-bit value
 /// never straddles two words.
-Id LoadGlobalSubword(EmitContext& ctx, Id address, u32 bits, bool is_signed) {
+Id LoadGlobalSubword(EmitContext& ctx, IR::Inst* inst, Id address, u32 bits, bool is_signed) {
     if (!ctx.profile.support_int64) {
         LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
         return ctx.u32_zero_value;
     }
     const Id aligned{ctx.OpBitwiseAnd(ctx.U64, address, ctx.Constant(ctx.U64, ~u64{3}))};
-    const Id word{ctx.OpFunctionCall(ctx.U32[1], ctx.load_global_func_u32, aligned)};
+    const Id word{ctx.OpFunctionCall(ctx.U32[1], ctx.GlobalMemoryFunctionsOf(*inst).load_u32,
+                                     aligned)};
     const Id byte{ctx.OpUConvert(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U64, address,
                                                                ctx.Constant(ctx.U64, u64{3})))};
     const Id shift{ctx.OpShiftLeftLogical(ctx.U32[1], byte, ctx.Const(3U))};
@@ -95,20 +96,20 @@ Id LoadGlobalSubword(EmitContext& ctx, Id address, u32 bits, bool is_signed) {
 }
 } // Anonymous namespace
 
-Id EmitLoadGlobalU8(EmitContext& ctx, Id address) {
-    return LoadGlobalSubword(ctx, address, 8, false);
+Id EmitLoadGlobalU8(EmitContext& ctx, IR::Inst* inst, Id address) {
+    return LoadGlobalSubword(ctx, inst, address, 8, false);
 }
 
-Id EmitLoadGlobalS8(EmitContext& ctx, Id address) {
-    return LoadGlobalSubword(ctx, address, 8, true);
+Id EmitLoadGlobalS8(EmitContext& ctx, IR::Inst* inst, Id address) {
+    return LoadGlobalSubword(ctx, inst, address, 8, true);
 }
 
-Id EmitLoadGlobalU16(EmitContext& ctx, Id address) {
-    return LoadGlobalSubword(ctx, address, 16, false);
+Id EmitLoadGlobalU16(EmitContext& ctx, IR::Inst* inst, Id address) {
+    return LoadGlobalSubword(ctx, inst, address, 16, false);
 }
 
-Id EmitLoadGlobalS16(EmitContext& ctx, Id address) {
-    return LoadGlobalSubword(ctx, address, 16, true);
+Id EmitLoadGlobalS16(EmitContext& ctx, IR::Inst* inst, Id address) {
+    return LoadGlobalSubword(ctx, inst, address, 16, true);
 }
 
 Id EmitLoadGlobal32(EmitContext& ctx, IR::Inst* inst, Id address) {
