@@ -20,8 +20,9 @@
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/evicted_pointer_slots.h"
+#include "video_core/buffer_cache/command_arena.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/evicted_pointer_slots.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -30,8 +31,6 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
-#include "video_core/stable_sampled_chunks.h"
-#include "video_core/texture_cache/draw_template.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -100,6 +99,8 @@ struct MeshEmulationSetup {
     u32 block_words{};          ///< output words per mesh workgroup
     u32 max_primitives{};       ///< primitives per mesh workgroup
     u32 primitive_vertices{3};  ///< vertices per primitive: 1 points, 2 lines, 3 triangles
+    /// Generic location carrying the mesh program's PrimitiveId to the pixel program, ~0 if none
+    u32 primitive_id_location{~0U};
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -114,13 +115,6 @@ struct MeshEmulationSetup {
     u32 vertex_lines{};
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
-
-/// The sampled textures and image descriptors of a draw, kept across frames (ConfigureImpl).
-using DrawTemplate =
-    VideoCommon::DrawTemplate<DescriptorUpdateEntry,
-                              Tegra::Engines::Maxwell3D::Regs::MaxShaderStage,
-                              Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>;
-using DrawTemplates = VideoCommon::DrawTemplateTable<DrawTemplate>;
 
 /// What an evicted graphics pipeline needs to be built again without translating its shaders
 struct KeptGraphicsStages {
@@ -142,12 +136,12 @@ public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
-        VideoCore::ShaderNotify* shader_notify, const Device& device,
-        DescriptorPool& descriptor_pool, GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, DrawTemplates& draw_templates,
-        const PipelineBuildQueue& build_queue, PipelineStatistics* pipeline_statistics,
-        RenderPassCache& render_pass_cache, const GraphicsPipelineCacheKey& key,
-        std::array<std::vector<u32>, NUM_STAGES> stages,
+        VideoCore::ShaderNotify* shader_notify,
+        const Device& device, DescriptorPool& descriptor_pool,
+        GuestDescriptorQueue& guest_descriptor_queue,
+        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
+        PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+        const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
@@ -188,6 +182,13 @@ public:
 
     bool SupportsAlphaToOne() const noexcept {
         return fragment_has_color0_output;
+    }
+
+    /// The vertex shader is the last pre-rasterization stage and puts every vertex on the far
+    /// plane, and depth bias enable is a dynamic state. Without a dynamic depth clamp enable the
+    /// pipeline clamps depth.
+    bool OnFarPlane() const noexcept {
+        return on_far_plane;
     }
 
     /// Color components of a render target the fragment shader writes, as VkColorComponentFlags
@@ -270,8 +271,50 @@ public:
 
     void AddTransition(GraphicsPipeline* transition);
 
-    bool Configure(bool is_indexed) {
-        return configure_func(this, is_indexed);
+    struct PreparedBinding {
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+        RenderAreaPushConstant render_area{};
+        std::shared_ptr<const std::vector<DescriptorUpdateEntry>> descriptors{};
+        VkDeviceSize descriptor_buffer_offset{};
+        u32 descriptor_buffer_chunk{};
+        std::optional<f32> down_factor{};
+        bool is_rescaling{};
+        std::optional<bool> bind_pipeline{};
+    };
+
+    void RecordPreparedBinding(const PreparedBinding& binding);
+
+    /// EDEN_NX2_RENDER_UNLEND: the back's half of an unlent draw, by value.
+    struct BackHalf {
+        /// Not value-initialized: the small vectors' inline storage stays untouched.
+        BackHalf() {}
+
+        /// Texture and image handles as read from memory, in descriptor order.
+        boost::container::small_vector<u32, 32> handles;
+        /// Buffer descriptor entries, stage by stage.
+        boost::container::small_vector<DescriptorUpdateEntry, 32> entries;
+        std::array<u16, NUM_STAGES> stage_entries{};
+        /// The buffer commands, played on GPURender as the draw's stamp.
+        VideoCommon::CommandArena commands;
+        u64 stamp{};
+    };
+    /// Per stage, the constant buffers the back reads handles and storage buffer descriptors
+    /// from (all of them where a handle is computed at draw time).
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstBuffers() const noexcept {
+        return handle_cbufs;
+    }
+    /// Whether the pipeline's draws can go unlent: built, no texture or image buffers. Task and
+    /// mesh pipelines need EDEN_NX2_RENDER_UNLEND_MESH and native mesh shaders (the rasterizer).
+    [[nodiscard]] bool CanUnlend() const noexcept {
+        return !unlend_texel_buffers && IsBuilt() && !Failed();
+    }
+    /// The back: the buffer bindings and the handle values, from the engine set by SetEngine.
+    void ConfigureBack(bool is_indexed, BackHalf& half, GuestDescriptorQueue& capture);
+    /// GPURender: the images, the descriptors and the binding, from `view`.
+    bool ConfigureRender(const BackHalf& half, const Tegra::Engines::Maxwell3D& view);
+
+    bool Configure(bool is_indexed, std::optional<PreparedBinding>* deferred = nullptr) {
+        return configure_func(this, is_indexed, deferred);
     }
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
@@ -325,11 +368,6 @@ public:
     /// Writes storage images or image buffers (their images are marked modified when resolved).
     [[nodiscard]] bool WritesImages() const noexcept {
         return writes_images;
-    }
-
-    /// Pipelines queued on or building in a worker thread.
-    [[nodiscard]] static u32 PendingBuilds() noexcept {
-        return pending_builds.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
@@ -397,7 +435,7 @@ public:
     /// the constant buffers again) and records the draw's descriptors with the image views,
     /// samplers and texture buffers the last captured Configure resolved. False when the draw
     /// can't be recorded, as for Configure.
-    bool ConfigureDelta(bool is_indexed);
+    bool ConfigureDelta(bool is_indexed, std::optional<PreparedBinding>* deferred = nullptr);
 
     /// The next Configure keeps the views and samplers it resolves for delta draws. With
     /// `verify`, it first compares them with the ones kept before; DeltaMismatch reports it.
@@ -415,7 +453,9 @@ public:
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
-        return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+        return [](GraphicsPipeline* pl, bool is_indexed, std::optional<PreparedBinding>* deferred) {
+            return pl->ConfigureImpl<Spec>(is_indexed, deferred);
+        };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -425,23 +465,18 @@ public:
 
 private:
     template <typename Spec>
-    bool ConfigureImpl(bool is_indexed);
+    bool ConfigureImpl(bool is_indexed, std::optional<PreparedBinding>* deferred);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
-    /// Keeps the draw's textures and image descriptors, which the guest descriptor queue holds
-    /// at `ranges`, for later draws with the same key. With `verified`, the template the key
-    /// found is compared with them first (EDEN_NX2_DRAW_TEMPLATE_VERIFY).
-    void KeepDrawTemplate(DrawTemplate* verified, const VideoCommon::DrawTemplateContext& context,
-                          std::span<const u32> handles, u64 hash,
-                          std::span<const VideoCommon::TextureHandleRead> reads,
-                          std::span<const VideoCommon::ImageViewInOut> views,
-                          std::span<const VideoCommon::SamplerId> samplers,
-                          const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
-                          const RescalingPushConstant& rescaling);
+    void CheckColorFeedbackLoop(std::span<const VideoCommon::ImageViewInOut> views,
+                                const std::array<bool, NUM_STAGES>& stages, size_t fragment_entry);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
-                       const RenderAreaPushConstant& render_are);
+                       const RenderAreaPushConstant& render_area,
+                       std::optional<PreparedBinding>* deferred);
+
+    void RecordBinding(const PreparedBinding& binding, const DescriptorUpdateEntry* descriptor_data);
 
     void MakePipeline(VkRenderPass render_pass);
 
@@ -458,12 +493,11 @@ private:
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
-    DrawTemplates& draw_templates;
-    const u64 template_owner;
-    VideoCommon::DrawTemplateRecorder template_recorder;
-    u64 last_template_context{}; ///< Hash of the last kept template's context (verify, profile)
 
-    bool (*configure_func)(GraphicsPipeline*, bool){};
+    bool (*configure_func)(GraphicsPipeline*, bool, std::optional<PreparedBinding>*){};
+    std::array<bool, NUM_STAGES> stages_present{};
+    bool unlend_texel_buffers{};
+    bool unlend_images{};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
@@ -476,8 +510,7 @@ private:
     std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
-    std::array<VideoCommon::StableSampled::ChunkCache<VkDescriptorImageInfo>, NUM_STAGES>
-        stable_sampled_chunks;
+    std::array<u32, NUM_STAGES> handle_cbufs{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
@@ -485,10 +518,11 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    bool on_far_plane{};
     u32 color_output_mask{};
     bool writes_storage{};
     /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
-    /// resolve them from texture_memo or a draw template.
+    /// resolve them from texture_memo.
     bool texture_memo_eligible{};
     VideoCommon::SampledTextureMemo texture_memo;
     bool writes_images{};
@@ -531,9 +565,9 @@ private:
     u64 kept_scale_epoch{};
     bool kept_images_valid{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by the PipelineLayoutCache
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
+    VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
@@ -544,7 +578,6 @@ private:
     u64 last_descriptor_buffer_generation{};
 
     const bool worker_only_build;
-    static inline std::atomic<u32> pending_builds{};
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
 

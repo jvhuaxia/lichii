@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -349,6 +350,12 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Guarding()) [[unlikely]] {
+        split.GuardStreamWrite(addr, sizeof(T));
+        if (const auto address = GpuToCpuAddress(addr)) {
+            split.StampWrite(*address, sizeof(T), VideoCommon::GpuSplit::Writer::Word);
+        }
+    }
     // A download for a guest read not yet in guest memory would land over this write later.
     if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
         if (const auto address = GpuToCpuAddress(addr);
@@ -597,12 +604,15 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     // Give Switch 2 sparse pages the write lands on their memory first, or have them keep it until
     // they get some (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.GuardStreamWrite(gpu_dest_addr, size);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
         FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
+        split.StampWrite(dev_addr_base, copy_amount, VideoCommon::GpuSplit::Writer::Block);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -620,6 +630,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
         FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
+        split.StampWrite(dev_addr_base, copy_amount, VideoCommon::GpuSplit::Writer::Block);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -674,6 +685,8 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
 
 void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size) {
     FinishReadsBefore(device_addr, size, true);
+    VideoCommon::GpuSplit::Get().StampWrite(device_addr, size,
+                                            VideoCommon::GpuSplit::Writer::ConstantData);
     const auto* src = static_cast<const u8*>(data);
     for (DAddr address = device_addr; address < device_addr + size;) {
         const std::size_t amount = (std::min<std::size_t>)(
@@ -696,6 +709,22 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data,
         }
     }
     constant_buffer_writes.emplace_back(device_addr, size);
+}
+
+bool MemoryManager::ConstantBufferDataMatches(DAddr device_addr, const void* data,
+                                              std::size_t size) {
+    const auto* src = static_cast<const u8*>(data);
+    for (DAddr address = device_addr; address < device_addr + size;) {
+        const std::size_t amount = (std::min<std::size_t>)(
+            device_addr + size - address, Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
+        const u8* const physical = memory.GetPointer<u8>(address);
+        if (physical == nullptr || std::memcmp(physical, src, amount) != 0) {
+            return false;
+        }
+        address += amount;
+        src += amount;
+    }
+    return true;
 }
 
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
@@ -848,7 +877,7 @@ const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
         auto next = std::make_shared<MappingSnapshot>();
         next->runs.reserve(continuous_runs.size());
         for (const auto& [begin, run] : continuous_runs) {
-            next->runs.push_back({begin, run.end});
+            next->runs.push_back({begin, run.end, run.device_addr});
         }
         {
             std::unique_lock<std::mutex> kind_lock(guard);
@@ -1044,15 +1073,75 @@ bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) cons
     return result;
 }
 
+template <bool is_gpu_address>
+bool MemoryManager::SubmappedRangeFromRuns(
+    GPUVAddr gpu_addr, std::size_t size,
+    boost::container::small_vector<
+        std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
+    const {
+    if (size == 0 || !IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
+        return false;
+    }
+    // A run is a maximal GPU range mapped to one device range, so the page walk ends a segment
+    // exactly where a run ends: at an unmapped page or where the device address jumps.
+    const GPUVAddr end = gpu_addr + size;
+    const auto& runs = CurrentSnapshot().runs;
+    auto it = std::upper_bound(
+        runs.begin(), runs.end(), gpu_addr,
+        [](GPUVAddr address, const MappingSnapshot::Run& run) { return address < run.begin; });
+    if (it != runs.begin() && std::prev(it)->end > gpu_addr) {
+        --it;
+    }
+    for (; it != runs.end() && it->begin < end; ++it) {
+        const GPUVAddr begin = (std::max)(it->begin, gpu_addr);
+        const GPUVAddr run_end = (std::min)(it->end, end);
+        if (begin >= run_end) {
+            continue;
+        }
+        if constexpr (is_gpu_address) {
+            result.emplace_back(begin, static_cast<std::size_t>(run_end - begin));
+        } else {
+            result.emplace_back(it->device_addr + (begin - it->begin),
+                                static_cast<std::size_t>(run_end - begin));
+        }
+    }
+    return true;
+}
+
+// GetSubmappedRange and GetSubmappedDeviceRange answer from the map-time runs instead of walking
+// the range page by page, as MaxContinuousRange does: the buffer cache's virtual ranges, fast draws
+// and sparse images ask them for the ranges they bind.
 boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
+    if (!SubmappedRangeFromRuns<true>(gpu_addr, size, result)) {
+        GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+    }
+    return result;
+}
+
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (!IsWithinGPUAddressRange(gpu_addr)) {
+        return result;
+    }
+    size = (std::min<u64>)(size, address_space_size - gpu_addr);
+    if (!SubmappedRangeFromRuns<false>(gpu_addr, size, result)) {
+        GetSubmappedRangeImpl<false>(gpu_addr, size, result);
+    }
+    return result;
+}
+
+boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
     GetSubmappedRangeImpl<true>(gpu_addr, size, result);
     return result;
 }
 
 boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
-MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
+MemoryManager::GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
     if (IsWithinGPUAddressRange(gpu_addr)) {
         GetSubmappedRangeImpl<false>(

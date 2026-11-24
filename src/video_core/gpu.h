@@ -183,6 +183,8 @@ public:
 
     /// Tick pending requests within the GPU.
     void TickWork();
+    /// Whether TickWork has requests to run.
+    [[nodiscard]] bool HasSyncRequests();
 
     /// Any thread: wakes the GPU thread to run queued sync operations (RunOnGpuThread) even
     /// while it has no commands to process.
@@ -226,6 +228,9 @@ public:
 
     [[nodiscard]] u64 GetTicks() const;
 
+    /// The running application changed: re-decides the report timestamp units for it.
+    void NotifyApplicationChanged(u64 program_id);
+
     [[nodiscard]] bool IsAsync() const;
 
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
@@ -235,8 +240,10 @@ public:
 
     void RendererFrameEndNotify();
 
+    /// `on_composited` runs on the GPU thread once the renderer has composited these layers.
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
-                          std::vector<Service::Nvidia::NvFence>&& fences);
+                          std::vector<Service::Nvidia::NvFence>&& fences,
+                          std::function<void()> on_composited = {});
 
     void WaitForComposite();
 

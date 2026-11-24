@@ -49,6 +49,7 @@
 #include "video_core/nx2_download_trace.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_owed_words.h"
 #include "video_core/rasterizer_download_area.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -424,6 +425,10 @@ public:
     template <typename Ranges>
     void ClaimCpuWrites(const Ranges& ranges);
 
+    /// Whether WriteMemory uploads a write on a page holding GPU-written data into its buffer
+    /// (Switch 2 titles, a buffer registered there) instead of downloading the page first.
+    [[nodiscard]] bool InlinesPageWrite(DAddr device_addr, u64 size);
+
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
@@ -440,7 +445,11 @@ public:
     void PopAsyncFlushes();
     void PopAsyncBuffers();
 
-    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
+    /// gpu_written_dest: the destination ranges that took GPU-written bytes, which guest memory
+    /// doesn't hold until they are downloaded
+    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+                 boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest =
+                     nullptr);
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
 
@@ -452,6 +461,13 @@ public:
         if (!collect) {
             nx2_list_copy_requests.clear();
         }
+    }
+    [[nodiscard]] bool Nx2HasListCopyRequests() const {
+        return !nx2_list_copy_requests.empty();
+    }
+    /// Pages a dispatch's NoteWorkRecorded records early downloads of.
+    [[nodiscard]] bool HasEarlyDownloads() const {
+        return !early_pages.empty();
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
@@ -475,6 +491,26 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    /// Whether DownloadMemory(device_addr, size) would download nothing: no deferred CPU read
+    /// ranges, and no GPU-modified range on the pages it visits.
+    [[nodiscard]] bool DownloadsNothing(DAddr device_addr, u64 size) {
+        if constexpr (USE_MEMORY_MAPS) {
+            if (download_cpu_read_ranges) {
+                return false;
+            }
+        }
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        return !IsRegionGpuModified(begin, end - begin);
+    }
+
+    /// Whether every byte the bound compute storage and texture buffers would mark GPU-written
+    /// for this dispatch already holds GPU writes. Call before the bindings are made (and mark).
+    [[nodiscard]] bool ComputeWritesHoldGpuData();
+
+    /// Whether every byte of the range holds GPU writes (a DMA clear or CPU write removes them).
+    [[nodiscard]] bool IsRegionFullyGpuModified(DAddr addr, size_t size);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
     /// host buffer holding each range, if one does, for diagnostics. Nothing is
@@ -678,7 +714,97 @@ private:
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    /// Uploads the CPU-modified bytes of [device_addr, +size) into `buffer` for `reader`, and the
+    /// GPU-written list words owed there over their placeholders (Nx2ListIndirect). Whether
+    /// nothing had to be uploaded.
+    bool SynchronizeBuffer(
+        Buffer& buffer, DAddr device_addr, u32 size,
+        Tegra::Nx2ListIndirect::OwedReader reader = Tegra::Nx2ListIndirect::OwedReader::Bind);
+
+    bool UploadModifiedMemory(Buffer& buffer, DAddr device_addr, u32 size);
+
+    /// The host GPU reads [device_addr, +size) for `reader` from `handle` at `offset`, filled
+    /// already: copies the GPU-written list words owed there over their placeholders. Whether it
+    /// copied any.
+    template <typename Handle>
+    bool Nx2PatchOwed(DAddr device_addr, u32 size, Handle handle, u64 offset,
+                      Tegra::Nx2ListIndirect::OwedReader reader) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, u64{size}); }) {
+            return runtime.Nx2PatchOwed(
+                device_addr, size, handle, offset,
+                [this](DAddr word) {
+                    return device_memory.template Read<u32>(word);
+                },
+                reader);
+        } else {
+            return false;
+        }
+    }
+
+    /// The host GPU wrote [device_addr, +size): the list words owed there are owed no more.
+    void Nx2ForgetOwed(DAddr device_addr, u64 size) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            runtime.Nx2ForgetOwed(device_addr, size);
+        }
+    }
+
+    /// Lands the GPU-written list words owed in [device_addr, +size) in guest memory at once, as
+    /// FlushRegion does (waits for the host GPU), and tells the buffer cache as
+    /// RasterizerVulkan::InvalidateCachedWrites would.
+    void Nx2LandOwed(DAddr device_addr, u64 size) {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            runtime.Nx2LandOwed(
+                device_addr, size, Tegra::Nx2ListIndirect::OwedReader::Flush,
+                [this](DAddr word, u32 value, u32 real) {
+                    if (!Tegra::Nx2ListIndirect::LandOwedWord(device_memory, word, value, real)) {
+                        return false;
+                    }
+                    const std::array<std::pair<DAddr, size_t>, 1> written{{{word, sizeof(u32)}}};
+                    ClaimCpuWrites(written);
+                    WriteMemory(word, sizeof(u32), true, true);
+                    return true;
+                });
+        }
+    }
+
+    /// The host GPU writes [device_addr, +size) of `buffer`: an owed list word it covers only in
+    /// part gets its slot word's other bytes in `buffer` first, and the range grows over the
+    /// whole word, so the write's download lands all of it in guest memory.
+    void Nx2WidenOverOwed(Buffer& buffer, DAddr& device_addr, u32& size) {
+        if constexpr (requires { runtime.Nx2OwedSpan(device_addr, u64{size}); buffer.Handle(); }) {
+            const auto owed = runtime.Nx2OwedSpan(device_addr, size);
+            if (!owed) {
+                return;
+            }
+            const auto patch = [&](DAddr begin, DAddr end) {
+                if (begin >= end || !buffer.IsInBounds(begin, end - begin)) {
+                    return false;
+                }
+                const u32 offset = buffer.Offset(begin);
+                const u32 bytes = static_cast<u32>(end - begin);
+                if (!Nx2PatchOwed(begin, bytes, buffer.Handle(), offset,
+                                  Tegra::Nx2ListIndirect::OwedReader::Bind)) {
+                    return false;
+                }
+                buffer.MarkUsage(offset, bytes);
+                return true;
+            };
+            const DAddr end = device_addr + size;
+            const DAddr begin = patch(owed->first, device_addr) ? owed->first : device_addr;
+            const DAddr last = patch(end, owed->second) ? owed->second : end;
+            device_addr = begin;
+            size = static_cast<u32>(last - begin);
+        }
+    }
+
+    /// Whether [device_addr, +size) holds GPU-written list words owed over their placeholders.
+    [[nodiscard]] bool Nx2Owes(DAddr device_addr, u64 size) const {
+        if constexpr (requires { runtime.Nx2Owes(device_addr, size); }) {
+            return runtime.Nx2Owes(device_addr, size);
+        } else {
+            return false;
+        }
+    }
 
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
@@ -742,7 +868,7 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
                                                bool table_pointer = false,
-                                               bool compute = false) const;
+                                               bool compute = false, bool sized = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
@@ -800,6 +926,33 @@ private:
         u64 deletions{};
     };
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    /// The buffer a binding slot last touched in the LRU, and in which frame (TouchBufferOnce).
+    struct TouchMemo {
+        u64 frame{~u64{0}};
+        BufferId buffer_id{};
+        u64 deletions{}; ///< buffer_deletions then: the id may be another buffer's since
+    };
+    std::array<TouchMemo, NUM_VERTEX_BUFFERS> vertex_touches{};
+    std::array<std::array<TouchMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_touches{};
+    void TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept;
+    /// FindBuffer's recent results by caching page.
+    struct FindMemo {
+        u64 page{~u64{0}};
+        u64 deletions{}; ///< buffer_deletions then
+        DAddr begin{};
+        DAddr end{};
+        BufferId buffer_id{};
+        bool sparse_compatible{};
+    };
+    std::array<FindMemo, 256> find_memos{};
+    /// Storage ranges VirtualRangeCache found in one segment (ResolveMultiRangeStorage).
+    struct SingleRangeMemo {
+        const Tegra::MemoryManager* memory{};
+        u64 map_serial{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+    };
+    std::array<SingleRangeMemo, 64> single_ranges{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged
@@ -1184,10 +1337,11 @@ private:
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
-        /// once: the front can't tell from what it sent which draws write the page, so it reads
-        /// no copy. A draw's writes reach a pushbuffer fetch only after a host-level wait, so
-        /// the page's lists read guest memory once the back ran the work before the last such
-        /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
+        /// once: the front can't tell from what it sent which draws write the page. A draw's
+        /// writes reach a pushbuffer fetch only after a host-level wait, so the page's lists are
+        /// read once the back ran the work before the last such wait: from guest memory if no
+        /// write came since the front flushed the page, else from a copy made after the last
+        /// write (Nx2ReadListCopy).
         bool draw_written{};
         std::optional<Nx2Staging> copy;
     };

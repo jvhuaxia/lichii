@@ -18,6 +18,14 @@ the maintainers, never into a public channel or issue. User names are replaced i
 settings even when the file log keeps them, and the Web Service and Multiplayer settings are left
 out.
 
+If a late graphics pass is missing because the GPU readback reached its 1 GiB cap, set
+`EDEN_NX2_FRAME_DUMP_FIRST_PASS` to a nonzero pass index before starting Lichii and capture once
+with Ctrl+F12. For example, `220` retains graphics pass 220 and later, their sampled inputs and
+the present source. Earlier passes still count, so the pass IDs do not renumber. This mode skips
+compute and buffer readbacks, and records the guest texture header as `tic_raw` beside the
+backing image's guest format and `native_tiling` flag. It also applies to direct frame dumps.
+Remove the setting after the capture; `0` leaves the usual whole-frame mode in place.
+
 Browse a bundle with `python3 -I tools/nx2/bundle_index.py <zip> [--out DIR]`. It unpacks the zip
 (refusing absolute paths, `..`, symlinks, more than 20000 entries or more than 2 GiB), writes
 `index.html` with the summary and a shaders table, and builds `frame/index.html` with
@@ -36,7 +44,7 @@ Parts are added in this order while they fit; the first five are always there.
 | `mods.json` | Update, DLC, mods and cheats the patch manager reports for the game, with enabled flags. |
 | `frame_times.json` | The last 10 s of guest presents: fps, percentiles, VSync buckets, stutters, every interval and the longest. Empty on Switch 1 games. |
 | `screenshot.png` | The presented frame, at most 1080 lines. |
-| `frame/manifest.jsonl` | The frame dump manifest (`EDEN_NX2_FRAME_DUMP` with `_SAMPLED`, see the AGENTS.md debugging table). Previews are JPEGs (`"png": null, "preview": "<name>.jpg"`) of at most 512 pixels a side; stats come from the full-precision data. `.raw.zst` files are not written (`"raw": null`). |
+| `frame/manifest.jsonl` | The frame dump manifest (`EDEN_NX2_FRAME_DUMP` with `_SAMPLED`, see the AGENTS.md debugging table). Previews are JPEGs (`"png": null, "preview": "<name>.jpg"`) of at most 512 pixels a side; stats come from the full-precision data. `.raw.zst` files are not written (`"raw": null`). Sampled textures keep every level of their view, BCn and ASTC decoded for the preview (`"decoded"`). They take at most half the 1 GiB capture budget and none more than 64 MiB, so the passes after them still fit: a mip chain that does not fit loses its finest levels first (`"levels_skipped_for_size"`), and one whose coarsest level does not fit is listed with `"skipped": "size"`. |
 | `frame/shaders/shaders.jsonl` | One line per pipeline the frame used, schema below. |
 | `logs/eden_log.txt` | This session's log, read from the file the logger writes (`eden_log_2.txt` when `eden_log.txt` was busy; the part's `note` says so). Over 8 MiB it keeps the first 1 MiB and the last 6 MiB, with a marker line between. |
 | `frame/shaders/native/` | Native programs as `EDEN_NX2_SHADER_DUMP` names them: `<key>-gfx-<addr>.bin` with `.header.bin`, `<key>-cs-<addr>.bin`; a program without a native key is `<hash>-maxwell-<addr>.bin`. |

@@ -268,6 +268,17 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
+    if (huge && may_fail) {
+        static std::atomic<u32> rejected{};
+        if (rejected.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image {}x{}x{} ({} levels, {} layers, format {}) exceeds the dense "
+                        "image limit; rejecting the allocation",
+                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                        ci.arrayLayers, static_cast<u32>(ci.format));
+        }
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -289,12 +300,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
-        UsesUnbackedFallback(texels, bytes, may_fail)) {
-        // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
-        // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
-        // nothing bound, so views and copies still work, instead of aborting. A smaller image
-        // gets one only for a caller that would throw otherwise.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !may_fail) {
         if (vk::Image sparse = CreateUnbackedImage(ci)) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
@@ -380,8 +386,17 @@ void MemoryAllocator::NoteHostPlacement(VmaAllocation allocation, VkDeviceSize s
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
-    if (ci.imageType == VK_IMAGE_TYPE_1D) {
+    if (ci.imageType != VK_IMAGE_TYPE_2D || !device.IsSparseResidencyImage2DSupported() ||
+        (aliased && !device.IsSparseResidencyAliasedSupported())) {
         return vk::Image{};
+    }
+    const auto& dld = device.GetDispatchLoader();
+    u32 sparse_formats{};
+    dld.vkGetPhysicalDeviceSparseImageFormatProperties(device.GetPhysical(), ci.format, ci.imageType,
+                                                       ci.samples, ci.usage, ci.tiling,
+                                                       &sparse_formats, nullptr);
+    if (sparse_formats == 0) {
+        return {};
     }
     VkImageCreateInfo sparse_ci = ci;
     sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
@@ -389,12 +404,10 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
         sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
     }
     VkImage sparse{};
-    if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr,
-                                                 &sparse) != VK_SUCCESS) {
+    if (dld.vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr, &sparse) != VK_SUCCESS) {
         return vk::Image{};
     }
-    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
-                     device.GetDispatchLoader());
+    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE, dld);
 }
 
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
@@ -444,15 +457,10 @@ void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     }
 }
 
-bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
                                                  const VmaAllocationCreateInfo& alloc_ci,
                                                  VkBuffer& handle, VmaAllocation& allocation,
                                                  VmaAllocationInfo& alloc_info) const {
-    // The buffer cache's buffers, churned by its collector: in a pool of their own (see
-    // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::SeparatePoolBlockSize / 2) {
-        return false;
-    }
     u32 memory_type{};
     {
         std::scoped_lock lk{buffer_type_mutex};
@@ -473,11 +481,38 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
     VmaAllocationCreateInfo pool_ci = alloc_ci;
     pool_ci.pool = pool;
     pool_ci.memoryTypeBits = 0;
-    return vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
-           VK_SUCCESS;
+    if (vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) != VK_SUCCESS) {
+        return false;
+    }
+    const auto block_size = device.GetDeviceBufferPoolBlockSize();
+    if (block_size == SmallDeviceBufferPoolBlockSize &&
+        !FitsDeviceBufferPool(alloc_info.size, 0, block_size)) {
+        vmaDestroyBuffer(allocator, handle, allocation);
+        handle = {};
+        allocation = {};
+        alloc_info = {};
+        return false;
+    }
+    return true;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    vk::Buffer buffer;
+    vk::Check(AllocateBuffer(ci, usage, 0, buffer));
+    return buffer;
+}
+
+vk::Buffer MemoryAllocator::TryCreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    vk::Buffer buffer;
+    const VkResult result = AllocateBuffer(ci, usage, 0, buffer);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return buffer;
+}
+
+VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                         VkDeviceSize min_alignment, vk::Buffer &buffer) const {
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -498,10 +533,18 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        VkResult result =
-            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+    const bool aligned = min_alignment > 1;
+    const auto create = [&](const VmaAllocationCreateInfo& create_ci) {
+        return aligned ? vmaCreateBufferWithAlignment(allocator, &ci, &create_ci, min_alignment,
+                                                      &handle, &allocation, &alloc_info)
+                       : vmaCreateBuffer(allocator, &ci, &create_ci, &handle, &allocation,
+                                         &alloc_info);
+    };
+    if (usage != MemoryUsage::DeviceLocal ||
+        !FitsDeviceBufferPool(ci.size, min_alignment, device.GetDeviceBufferPoolBlockSize()) ||
+        !CreateBufferInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)) {
+        VkResult result = create(alloc_ci);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
             // Over the device memory budget, as images are in CreateImage: buffers have no
             // unbacked fallback, and the vk::Exception a failed staging or buffer cache
             // allocation throws from the GPU thread aborts the process. Phones share RAM with
@@ -522,9 +565,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             }
             VmaAllocationCreateInfo relaxed = alloc_ci;
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+            result = create(relaxed);
         }
-        vk::Check(result);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
     if (usage == MemoryUsage::DeviceLocal) {
@@ -550,61 +595,16 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
-    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
-                      location, device.GetDispatchLoader());
+    buffer = vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data,
+                        is_coherent, location, device.GetDispatchLoader());
+    return VK_SUCCESS;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                          VkDeviceSize min_alignment) const {
-    if (min_alignment <= 1) {
-        return CreateBuffer(ci, usage);
-    }
-    VkMemoryPropertyFlags anv_flags = 0;
-    if (usage == MemoryUsage::Stream &&
-        device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
-        anv_flags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-    }
-    u32 memory_type_bits = valid_memory_types;
-    if (usage == MemoryUsage::Stream) {
-        memory_type_bits = 0u;
-    }
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
-        .usage = MemoryUsageVma(usage),
-        .requiredFlags = 0,
-        .preferredFlags = MemoryUsagePreferredVmaFlags(usage) | anv_flags,
-        .memoryTypeBits = memory_type_bits,
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-        .priority = 0.f,
-    };
-
-    VkBuffer handle{};
-    VmaAllocationInfo alloc_info{};
-    VmaAllocation allocation{};
-    VkMemoryPropertyFlags property_flags{};
-
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
-    vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
-    if (usage == MemoryUsage::DeviceLocal) {
-        NoteHostPlacement(allocation, alloc_info.size, false);
-    }
-
-    u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
-    std::span<u8> mapped_data{};
-    if (data) {
-        mapped_data = std::span<u8>{data, ci.size};
-    }
-    const bool is_coherent = (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-
-    const vk::MemoryLocation location{
-        .memory = alloc_info.deviceMemory,
-        .offset = alloc_info.offset,
-        .memory_type = alloc_info.memoryType,
-    };
-    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
-                      location, device.GetDispatchLoader());
+    vk::Buffer buffer;
+    vk::Check(AllocateBuffer(ci, usage, min_alignment, buffer));
+    return buffer;
 }
 
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)

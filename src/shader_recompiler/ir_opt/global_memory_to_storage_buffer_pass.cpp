@@ -4,13 +4,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
 #include <array>
 #include <bit>
 #include <deque>
 #include <map>
 #include <optional>
-#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,17 +39,20 @@ struct StorageBufferAddr {
     u32 indirect{~0U};
 };
 
+/// True when the range holds the address. Compares through a predicate: MSVC 14.51's STL sends
+/// std::ranges::find on this 12-byte type to its vectorized search, which only takes elements of
+/// 1, 2, 4 or 8 bytes and fails a static assertion.
+template <typename Range>
+bool ContainsAddr(const Range& range, const StorageBufferAddr& addr) {
+    return std::ranges::any_of(range,
+                               [&addr](const StorageBufferAddr& other) { return other == addr; });
+}
+
 /// Block iterator to a global memory instruction and the storage buffer it uses
 struct StorageInst {
     StorageBufferAddr storage_buffer;
     IR::Inst* inst;
     IR::Block* block;
-    /// For a buffer whose pointer is loaded from memory (storage_buffer.indirect), the low word
-    /// of that loaded pointer: the access's offset is taken from it, not from a constant buffer.
-    IR::Value loaded_pointer{};
-    /// The phi that merges the address built from loaded_pointer with a null address, if any:
-    /// the access reads zero on the null path.
-    IR::Inst* null_phi{};
 };
 
 /// Bias towards a certain range of constant buffers when looking for storage buffers
@@ -70,6 +71,33 @@ using StorageInstVector = small_vector<StorageInst, 24>;
 using StorageWritesSet =
     flat_set<StorageBufferAddr, std::less<StorageBufferAddr>, small_vector<StorageBufferAddr, 16>>;
 
+/// Slots first + n * stride of a pointer array read at a dynamic offset (stride is not zero)
+struct PointerArray {
+    StorageBufferAddr first;
+    u32 stride;
+};
+
+/// The pointers a native global access's address can come from, see NativePointerCandidates
+struct NativeCandidates {
+    small_vector<StorageBufferAddr, 4> pointers;
+    /// Arrays the pointers were read from at a dynamic offset. The search takes their first slots
+    /// only, and any slot is one the address can come from.
+    small_vector<PointerArray, 2> arrays;
+    /// Every path of the address reaches one of the pointers. Otherwise a path goes through an
+    /// instruction the search does not follow, or a table entry it left out, and can carry a
+    /// pointer bound for another access.
+    bool complete{};
+    /// The access block the table holder search left phi inputs out for (see AllowsPhi)
+    const IR::Block* pruned_at{};
+};
+
+/// A global access left for the backend to route among its own candidate buffers
+struct RoutedAccess {
+    IR::Inst* inst;
+    StorageBufferSet buffers;
+    small_vector<PointerArray, 2> arrays;
+};
+
 struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
@@ -87,7 +115,9 @@ struct StorageInfo {
     /// searches from other addresses skip what failed ones walked.
     std::unordered_set<const IR::Inst*> biased_exhausted;
     std::unordered_set<const IR::Inst*> unbiased_exhausted;
-    std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
+    std::unordered_map<const IR::Inst*, NativeCandidates> native_candidates;
+    /// Accesses left global whose candidates are complete and all bound
+    std::vector<RoutedAccess> routed;
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
     /// A native access with several candidate pointers was left global.
@@ -465,25 +495,29 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
 std::optional<StorageBufferAddr> TrackAddend(const IR::Value& value) {
     std::optional<StorageBufferAddr> result;
     bool ambiguous{};
-    const auto visit{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    // Explicit stack, not recursion: a long IAdd32 chain would take one host frame per addition
+    // (the same overflow as CollectIteratorWords). Pushing Arg(1) first keeps Arg(0) first.
+    std::vector<IR::Value> pending{value};
+    while (!pending.empty() && !ambiguous) {
+        const IR::Value term{pending.back()};
+        pending.pop_back();
+        if (term.IsImmediate()) {
+            continue;
         }
         const IR::Inst* const inst{term.InstRecursive()};
         if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+            pending.push_back(inst->Arg(1));
+            pending.push_back(inst->Arg(0));
+            continue;
         }
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
             !inst->Arg(1).IsImmediate() || !Common::IsAligned(inst->Arg(1).U32(), 8)) {
-            return;
+            continue;
         }
         const StorageBufferAddr found{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
         ambiguous = result.has_value();
         result = found;
-    }};
-    visit(visit, value);
+    }
     return ambiguous ? std::nullopt : result;
 }
 
@@ -1121,37 +1155,40 @@ std::optional<std::pair<u32, u32>> DynamicPointerSlots(const IR::Value& offset) 
 }
 
 /// Slots of a pointer array read at a dynamic offset, following phis and selects of the offset.
-/// A stride of zero is a single slot.
-void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u32>, 4>& slots,
+/// A stride of zero is a single slot. Returns false when a path of the offset matches no slot
+/// pattern.
+bool CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u32>, 4>& slots,
                          std::unordered_set<const IR::Inst*>& visited) {
     if (offset.IsImmediate()) {
         if (std::ranges::find(slots, std::pair{offset.U32(), 0U}) == slots.end()) {
             slots.emplace_back(offset.U32(), 0U);
         }
-        return;
+        return true;
     }
     const IR::Inst* const inst{offset.InstRecursive()};
     if (!visited.insert(inst).second) {
-        return;
+        return true;
     }
     if (const auto pattern{DynamicPointerSlots(offset)}) {
         if (std::ranges::find(slots, *pattern) == slots.end()) {
             slots.push_back(*pattern);
         }
-        return;
+        return true;
     }
     switch (inst->GetOpcode()) {
-    case IR::Opcode::Phi:
+    case IR::Opcode::Phi: {
+        bool complete{true};
         for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-            CollectPointerSlots(inst->Arg(arg), slots, visited);
+            complete &= CollectPointerSlots(inst->Arg(arg), slots, visited);
         }
-        break;
-    case IR::Opcode::SelectU32:
-        CollectPointerSlots(inst->Arg(1), slots, visited);
-        CollectPointerSlots(inst->Arg(2), slots, visited);
-        break;
+        return complete;
+    }
+    case IR::Opcode::SelectU32: {
+        const bool lhs{CollectPointerSlots(inst->Arg(1), slots, visited)};
+        return CollectPointerSlots(inst->Arg(2), slots, visited) && lhs;
+    }
     default:
-        break;
+        return false;
     }
 }
 
@@ -1159,10 +1196,60 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
 /// additions, selects and phis. A predicated address assignment becomes a phi whose other input
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array.
-small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_addr,
-                                                           Environment& env, bool& dynamic,
-                                                           StorageInfo& info) {
-    small_vector<StorageBufferAddr, 4> candidates;
+NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env, bool& dynamic,
+                                         StorageInfo& info, const TrackingConditions& conditions) {
+    NativeCandidates result;
+    auto& candidates{result.pointers};
+    // Whether each pointer source the search reached (a constant buffer read or a table load)
+    // gave its pointers: a missing entry is one that did not.
+    std::unordered_map<const IR::Inst*, bool> sources;
+    // Table loads whose pointer reaches the address from another iteration (a loop back edge) or
+    // another lane (a shuffle): the access's conditions say nothing about their table pointer.
+    std::unordered_set<const IR::Inst*> foreign_loads;
+    {
+        std::deque<std::pair<const IR::Inst*, bool>> queue{{low_addr.InstRecursive(), false}};
+        std::array<std::unordered_set<const IR::Inst*>, 2> seen;
+        while (!queue.empty()) {
+            const auto [inst, foreign] = queue.front();
+            queue.pop_front();
+            if (!seen[foreign].insert(inst).second) {
+                continue;
+            }
+            const auto follow = [&](const IR::Value& value, bool next_foreign) {
+                if (!value.IsImmediate()) {
+                    queue.emplace_back(value.InstRecursive(), next_foreign);
+                }
+            };
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::Phi:
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    follow(inst->Arg(arg), foreign || (inst->GetOpcode() == IR::Opcode::Phi &&
+                                                       conditions.IsBackEdge(inst, arg)));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                follow(inst->Arg(1), foreign);
+                follow(inst->Arg(2), foreign);
+                break;
+            case IR::Opcode::ShuffleIndex:
+                follow(inst->Arg(0), true);
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                    follow(inst->Arg(0), foreign);
+                }
+                break;
+            case IR::Opcode::LoadGlobal64:
+                if (foreign) {
+                    foreign_loads.insert(inst);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
     const auto enqueue = [&](const IR::Value& value) {
@@ -1181,30 +1268,37 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 static constexpr u32 max_slots{16};
                 small_vector<std::pair<u32, u32>, 4> slots;
                 std::unordered_set<const IR::Inst*> slot_visited;
-                CollectPointerSlots(offset, slots, slot_visited);
+                const bool complete{CollectPointerSlots(offset, slots, slot_visited) &&
+                                    !slots.empty()};
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        result.arrays.push_back(
+                            {.first{.index = index.U32(), .offset = first}, .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            !ContainsAddr(candidates, pointer) &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
                         }
                     }
                 }
+                sources.emplace(inst, complete);
                 break;
             }
             if (!index.IsImmediate() || !offset.IsImmediate()) {
                 break;
             }
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
-            if (Common::IsAligned(pointer.offset, 8) &&
-                std::ranges::find(candidates, pointer) == candidates.end() &&
-                env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
+            const bool is_pointer{Common::IsAligned(pointer.offset, 8) &&
+                                  env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)};
+            if (is_pointer && !ContainsAddr(candidates, pointer)) {
                 candidates.push_back(pointer);
             }
+            sources.emplace(inst, is_pointer);
             break;
         }
         case IR::Opcode::IAdd32:
@@ -1259,53 +1353,86 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 break;
             }
             const u32 indirect{static_cast<u32>(holder_offset)};
+            bool table_complete{true};
             // The table pointer can also be one of several constant buffer pointers (a phi or
             // select of them), or an entry of a constant buffer array indexed at run time (one
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                if (ContainsAddr(candidates, pointer)) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
                     // Graphics programs bind every candidate for every draw: table entries
                     // multiply the storage buffers of draws that never read them.
+                    table_complete = false;
                     return;
                 }
                 if (table) {
                     info.tables_seen = true;
                     if (!info.tables_enabled) {
+                        table_complete = false;
                         return;
                     }
-                    if (std::ranges::find(info.table_candidates, pointer) ==
-                        info.table_candidates.end()) {
+                    if (!ContainsAddr(info.table_candidates, pointer)) {
                         info.table_candidates.push_back(pointer);
                     }
                 }
                 candidates.push_back(pointer);
                 dynamic = true;
             };
-            small_vector<std::pair<const IR::Inst*, bool>, 4> holders{{holder_root, false}};
-            std::unordered_set<const IR::Inst*> holder_visited{holder_root};
+            // Each holder, whether it was reached through a phi or select, and whether its value
+            // can come from another iteration or lane
+            small_vector<std::tuple<const IR::Inst*, bool, bool>, 4> holders{
+                {holder_root, false, foreign_loads.contains(inst)}};
+            std::array<std::unordered_set<const IR::Inst*>, 2> holder_visited;
+            holder_visited[std::get<2>(holders.front())].insert(holder_root);
             for (size_t pending_holder = 0; pending_holder < holders.size(); ++pending_holder) {
-                const auto [holder, via_phi] = holders[pending_holder];
-                const auto enqueue_holder = [&](const IR::Value& value, bool branch) {
-                    if (!value.IsImmediate() && holders.size() < 8 &&
-                        holder_visited.insert(value.InstRecursive()).second) {
-                        holders.emplace_back(value.InstRecursive(), via_phi || branch);
+                const auto [holder, via_phi, foreign] = holders[pending_holder];
+                const auto enqueue_holder = [&](const IR::Value& value, bool branch,
+                                                bool back_edge = false) {
+                    const bool next_foreign{foreign || back_edge};
+                    if (value.IsImmediate() ||
+                        (holders.size() >= 8 &&
+                         !holder_visited[next_foreign].contains(value.InstRecursive()))) {
+                        table_complete = false;
+                        return;
+                    }
+                    if (holder_visited[next_foreign].insert(value.InstRecursive()).second) {
+                        holders.emplace_back(value.InstRecursive(), via_phi || branch,
+                                             next_foreign);
                     }
                 };
                 switch (holder->GetOpcode()) {
                 case IR::Opcode::CompositeExtractU32x2:
                     if (holder->Arg(1).IsImmediate() && holder->Arg(1).U32() == 0) {
                         enqueue_holder(holder->Arg(0), false);
+                    } else {
+                        table_complete = false;
                     }
                     continue;
-                case IR::Opcode::Phi:
+                case IR::Opcode::Phi: {
+                    // A predicated table pointer assignment: the input of the path that skips it
+                    // cannot reach an access under the same predicate.
+                    small_vector<size_t, 4> feasible;
                     for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
-                        enqueue_holder(holder->Arg(arg), true);
+                        if (foreign || conditions.AllowsPhi(holder, arg)) {
+                            feasible.push_back(arg);
+                        }
+                    }
+                    if (feasible.empty()) {
+                        for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
+                            feasible.push_back(arg);
+                        }
+                    } else if (feasible.size() < holder->NumArgs()) {
+                        result.pruned_at = conditions.current;
+                    }
+                    for (const size_t arg : feasible) {
+                        enqueue_holder(holder->Arg(arg), feasible.size() > 1,
+                                       conditions.IsBackEdge(holder, arg));
                     }
                     continue;
+                }
                 case IR::Opcode::SelectU32:
                     enqueue_holder(holder->Arg(1), true);
                     enqueue_holder(holder->Arg(2), true);
@@ -1314,9 +1441,11 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 case IR::Opcode::GetCbufU32x2:
                     break;
                 default:
+                    table_complete = false;
                     continue;
                 }
                 if (!holder->Arg(0).IsImmediate()) {
+                    table_complete = false;
                     continue;
                 }
                 const u32 index{holder->Arg(0).U32()};
@@ -1326,14 +1455,22 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     if (Common::IsAligned(pointer.offset, 8) &&
                         env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                         add(pointer, via_phi || !holder_addr);
+                    } else {
+                        table_complete = false;
                     }
                     continue;
                 }
                 static constexpr u32 max_slots{16};
                 small_vector<std::pair<u32, u32>, 4> slots;
                 std::unordered_set<const IR::Inst*> slot_visited;
-                CollectPointerSlots(holder->Arg(1), slots, slot_visited);
+                table_complete &=
+                    CollectPointerSlots(holder->Arg(1), slots, slot_visited) && !slots.empty();
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        result.arrays.push_back(
+                            {.first{.index = index, .offset = first, .indirect = indirect},
+                             .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{
                             .index = index, .offset = first + slot * stride, .indirect = indirect};
@@ -1345,292 +1482,60 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     }
                 }
             }
+            sources.emplace(inst, table_complete);
             break;
         }
         default:
             break;
         }
     }
-    return candidates;
-}
-
-/// The one pointer loaded from memory that a low address is built from.
-struct LoadedPointer {
-    IR::Value low;        ///< The pointer's low word
-    IR::Inst* null_phi{}; ///< The phi merging the address built from it with null, if any
-    bool offsets{};       ///< Terms are added beside the pointer (or its null phi), at this level
-    /// The low word's additions: the high word may add their carries
-    small_vector<const IR::Inst*, 8> adds;
-};
-
-/// LoadedPointerLow's walk. Returns false when the address adds up more than one loaded pointer
-/// (or the walk gives up); otherwise result.low is the pointer found, empty if there is none.
-bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 depth) {
-    small_vector<IR::Value, 8> pending{low_addr};
-    while (!pending.empty()) {
-        const IR::Value value{pending.back()};
-        pending.pop_back();
-        if (value.IsImmediate()) {
-            result.offsets |= value.Type() != IR::Type::U32 || value.U32() != 0;
-            continue;
-        }
-        IR::Inst* const inst{value.InstRecursive()};
-        switch (inst->GetOpcode()) {
-        case IR::Opcode::IAdd32:
-            if (pending.size() + 2 > 8) {
-                return false;
-            }
-            result.adds.push_back(inst);
-            pending.push_back(inst->Arg(0));
-            pending.push_back(inst->Arg(1));
-            break;
-        case IR::Opcode::CompositeExtractU32x2: {
-            const IR::Value vector{inst->Arg(0)};
-            if (vector.IsImmediate()) {
-                result.offsets = true;
-                break;
-            }
-            const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
-            if (source != IR::Opcode::LoadGlobal64 && source != IR::Opcode::LoadStorage64) {
-                result.offsets = true;
-                break;
-            }
-            if (!inst->Arg(1).IsImmediate() || inst->Arg(1).U32() != 0 || !result.low.IsEmpty()) {
-                // The high word of a pointer, or a second pointer
-                return false;
-            }
-            result.low = IR::Value{inst};
-            break;
-        }
-        case IR::Opcode::Phi: {
-            // A loop carries the pointer unchanged: Phi(pointer, itself). A phi of one address
-            // and zeros is that address or null. Any other phi that merges a loaded pointer
-            // merges two pointers; a phi of offsets is an offset term.
-            std::optional<IR::Value> unique;
-            std::optional<IR::Value> unique_nonzero;
-            bool merges_pointer{};
-            bool trivial{true};
-            bool one_nonzero{true};
-            bool has_zero{};
-            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-                const IR::Value operand{inst->Arg(arg).Resolve()};
-                if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
-                    continue;
-                }
-                if (!operand.IsImmediate()) {
-                    const IR::Inst* const def{operand.InstRecursive()};
-                    if (def->GetOpcode() == IR::Opcode::CompositeExtractU32x2 &&
-                        !def->Arg(0).IsImmediate()) {
-                        const IR::Opcode source{def->Arg(0).InstRecursive()->GetOpcode()};
-                        merges_pointer |= source == IR::Opcode::LoadGlobal64 ||
-                                          source == IR::Opcode::LoadStorage64;
-                    }
-                }
-                if (!unique) {
-                    unique = operand;
-                } else if (*unique != operand) {
-                    trivial = false;
-                }
-                if (operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
-                    operand.U32() == 0) {
-                    has_zero = true;
-                } else if (!unique_nonzero) {
-                    unique_nonzero = operand;
-                } else if (*unique_nonzero != operand) {
-                    one_nonzero = false;
-                }
-            }
-            if (trivial && unique) {
-                pending.push_back(*unique);
-                break;
-            }
-            // EDEN_NX2_NULL_PHI_POINTERS=0 treats such a phi as before (the generic path).
-            static const bool null_phi_pointers = [] {
-                const char* value = std::getenv("EDEN_NX2_NULL_PHI_POINTERS");
-                return value == nullptr || value[0] != '0';
-            }();
-            if (null_phi_pointers && has_zero && one_nonzero && unique_nonzero && depth < 4) {
-                LoadedPointer merged;
-                if (!WalkLoadedPointer(*unique_nonzero, merged, depth + 1)) {
-                    return false;
-                }
-                result.adds.insert(result.adds.end(), merged.adds.begin(), merged.adds.end());
-                if (!merged.low.IsEmpty()) {
-                    if (!result.low.IsEmpty() || merged.null_phi != nullptr ||
-                        result.null_phi != nullptr) {
-                        // A second pointer, or null merged in twice
-                        return false;
-                    }
-                    result.low = merged.low;
-                    result.null_phi = inst;
-                }
-                // Without a pointer below it, a phi of offsets
-                result.offsets |= merged.low.IsEmpty();
-                break;
-            }
-            if (merges_pointer) {
-                return false;
-            }
-            result.offsets = true;
-            break;
-        }
-        default:
-            // An offset term (shifts, multiplies, conversions of indices)
-            result.offsets = true;
-            break;
-        }
+    // The pointer is in one input of an addition (the others are offsets), in every input of a phi
+    // or select. A greatest fixed point: a phi reached again through a loop is complete when the
+    // values entering the loop are.
+    std::unordered_map<const IR::Inst*, bool> complete;
+    for (const IR::Inst* const inst : pending) {
+        complete.emplace(inst, true);
     }
-    return true;
-}
-
-/// Whether a value is the carry out of one of these additions, as 64-bit additions are split:
-/// Select(GetCarryFromOp(add), 1, 0).
-bool IsCarryOf(const IR::Inst& select, std::span<const IR::Inst* const> adds) {
-    const IR::Value condition{select.Arg(0)};
-    if (condition.IsImmediate() || !select.Arg(1).IsImmediate() || select.Arg(1).U32() != 1 ||
-        !select.Arg(2).IsImmediate() || select.Arg(2).U32() != 0) {
-        return false;
-    }
-    const IR::Inst* const carry{condition.InstRecursive()};
-    if (carry->GetOpcode() != IR::Opcode::GetCarryFromOp || carry->Arg(0).IsImmediate()) {
-        return false;
-    }
-    return std::ranges::find(adds, carry->Arg(0).InstRecursive()) != adds.end();
-}
-
-/// Whether an address's high word is the high word of the pointer its low word was built from
-/// (pointer.low), plus carries out of the low word's additions and nothing else.
-bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) {
-    const IR::Inst* const load{pointer.low.InstRecursive()->Arg(0).InstRecursive()};
-    // Whether the low word's null phi takes zero from a predecessor.
-    const auto null_from = [&](const IR::Block* predecessor) -> std::optional<bool> {
-        for (size_t arg = 0; arg < pointer.null_phi->NumArgs(); ++arg) {
-            if (pointer.null_phi->PhiBlock(arg) == predecessor) {
-                const IR::Value operand{pointer.null_phi->Arg(arg).Resolve()};
-                return operand.IsImmediate();
-            }
-        }
-        return std::nullopt;
+    const auto is_complete = [&](const IR::Value& value) {
+        return !value.IsImmediate() && complete.at(value.InstRecursive());
     };
-    bool found{};
-    bool high_null{};
-    small_vector<IR::Value, 8> pending{high};
-    while (!pending.empty()) {
-        const IR::Value value{pending.back()};
-        pending.pop_back();
-        if (value.IsImmediate()) {
-            // A nonzero constant moves the address by multiples of 4 GiB: not a carry
-            if (value.Type() != IR::Type::U32 || value.U32() != 0) {
-                return false;
-            }
-            continue;
-        }
-        IR::Inst* const inst{value.InstRecursive()};
-        switch (inst->GetOpcode()) {
-        case IR::Opcode::IAdd32:
-            if (pending.size() + 2 > 8) {
-                return false;
-            }
-            pending.push_back(inst->Arg(0));
-            pending.push_back(inst->Arg(1));
-            break;
-        case IR::Opcode::CompositeExtractU32x2: {
-            const IR::Value vector{inst->Arg(0)};
-            if (vector.IsImmediate()) {
-                return false;
-            }
-            const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
-            if (source != IR::Opcode::LoadGlobal64 && source != IR::Opcode::LoadStorage64) {
-                return false;
-            }
-            // A loaded pointer's word: only the same pointer's high word, once.
-            if (vector.InstRecursive() != load || !inst->Arg(1).IsImmediate() ||
-                inst->Arg(1).U32() != 1 || found) {
-                return false;
-            }
-            found = true;
-            break;
-        }
-        case IR::Opcode::Phi: {
-            // A loop carries the high word unchanged: Phi(high, itself). A phi of it and zero is
-            // the high half of a null address: zero on exactly the paths the low word is null on.
-            std::optional<IR::Value> nonzero;
-            bool has_zero{};
-            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-                const IR::Value operand{inst->Arg(arg).Resolve()};
-                if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
-                    continue;
-                }
-                if (operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
-                    operand.U32() == 0) {
-                    has_zero = true;
-                    continue;
-                }
-                if (nonzero && *nonzero != operand) {
-                    return false;
-                }
-                nonzero = operand;
-            }
-            if (has_zero && pointer.null_phi != nullptr) {
+    for (bool changed{true}; changed;) {
+        changed = false;
+        for (const IR::Inst* const inst : pending) {
+            bool value{};
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+                value = is_complete(inst->Arg(0)) || is_complete(inst->Arg(1));
+                break;
+            case IR::Opcode::Phi:
+                value = true;
                 for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-                    const IR::Value operand{inst->Arg(arg).Resolve()};
-                    if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
-                        continue;
-                    }
-                    const bool zero{operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
-                                    operand.U32() == 0};
-                    if (null_from(inst->PhiBlock(arg)) != std::optional<bool>{zero}) {
-                        // Not zero on exactly the low word's null paths
-                        return false;
-                    }
+                    value &= is_complete(inst->Arg(arg));
                 }
+                break;
+            case IR::Opcode::SelectU32:
+                value = is_complete(inst->Arg(1)) && is_complete(inst->Arg(2));
+                break;
+            case IR::Opcode::ShuffleIndex:
+                value = is_complete(inst->Arg(0));
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                value = inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0 &&
+                        is_complete(inst->Arg(0));
+                break;
+            default: {
+                const auto source{sources.find(inst)};
+                value = source != sources.end() && source->second;
+                break;
             }
-            if (has_zero) {
-                if (pointer.null_phi == nullptr || high_null) {
-                    // Null where the low word isn't, or a second null merge
-                    return false;
-                }
-                high_null = true;
             }
-            if (nonzero) {
-                pending.push_back(*nonzero);
+            if (value != complete[inst]) {
+                complete[inst] = value;
+                changed = true;
             }
-            break;
-        }
-        case IR::Opcode::SelectU32:
-            // The carry out of one of the low word's additions: Select(GetCarryFromOp(add), 1, 0)
-            if (!IsCarryOf(*inst, pointer.adds)) {
-                return false;
-            }
-            break;
-        default:
-            // Anything else added to the high word isn't proven to be a carry
-            return false;
         }
     }
-    // A pointer or null: the high word has to be null on the same paths, for the whole address
-    // to be null there.
-    return found && (pointer.null_phi == nullptr || high_null);
-}
-
-/// The one pointer loaded from memory that an address is built from: its low word is that
-/// pointer's low word plus offsets (IAdd32 of values that read no other pointer), or null where a
-/// phi merges it with zero, and its high word that pointer's high word plus carries. Returns
-/// nothing otherwise.
-std::optional<LoadedPointer> LoadedPointerLow(const LowAddrInfo& address) {
-    if (address.value.IsImmediate()) {
-        return std::nullopt;
-    }
-    LoadedPointer result;
-    if (!WalkLoadedPointer(IR::Value{address.value}, result, 0) || result.low.IsEmpty() ||
-        !HighFromLoadedPointer(IR::Value{address.high}, result)) {
-        return std::nullopt;
-    }
-    // On the null paths the address is only null when nothing is added after the merge (the
-    // offsets the pointer's path adds are inside it).
-    if (result.null_phi != nullptr && (result.offsets || address.imm_offset != 0)) {
-        return std::nullopt;
-    }
+    result.complete = complete.at(low_addr.InstRecursive());
     return result;
 }
 
@@ -1670,75 +1575,48 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
+        if (it != info.native_candidates.end() && it->second.pruned_at &&
+            it->second.pruned_at != conditions.current) {
+            // Searched for an access in another block, whose conditions left other inputs out
+            info.native_candidates.erase(it);
+            it = info.native_candidates.end();
+        }
         if (it == info.native_candidates.end()) {
             bool dynamic{};
             it = info.native_candidates
-                     .emplace(start, NativePointerCandidates(low_addr, env, dynamic, info))
+                     .emplace(start,
+                              NativePointerCandidates(low_addr, env, dynamic, info, conditions))
                      .first;
             if (dynamic) {
                 info.native_dynamic.insert(start);
             }
         }
-        const auto& candidates{it->second};
+        const auto& candidates{it->second.pointers};
         const bool has_loaded_pointer{std::ranges::any_of(
             candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
-        std::optional<LoadedPointer> single_loaded;
-        if (!paired_found && candidates.size() == 1 && candidates.front().indirect != ~0U &&
-            !IsGlobalMemoryWrite(inst) &&
-            std::ranges::find(info.table_candidates, candidates.front()) ==
-                info.table_candidates.end()) {
-            single_loaded = LoadedPointerLow(*low_addr_info);
-            // A pointer or null: only the reads whose null path is given its zero below.
-            // Not in compute shaders: The Duskbloods' tiled compute pass 6148b6ff87c55d4f
-            // (120x68 groups) took ~100 ms a frame instead of 0.6 ms during area transitions with
-            // them (EDEN_NX2_NULL_PHI_POINTERS=0 made the transitions smooth again).
-            if (single_loaded && single_loaded->null_phi != nullptr &&
-                (inst.GetOpcode() != IR::Opcode::LoadGlobal32 ||
-                 env.ShaderStage() == Stage::Compute)) {
-                single_loaded.reset();
-            }
-        }
         if (paired_found &&
             (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
             // No pointer loaded from memory competes with the paired one, or the access cannot
             // stay global: keep the pair.
-        } else if (single_loaded) {
-            // A read through the one pointer loaded from memory, plus offsets (The Duskbloods'
-            // tile-based lighting reads each light record at *(*c10[0x118]) + light * 64 + 60):
-            // read it from that pointer's binding directly. Kept global, every read searched all
-            // of the program's buffers for the one holding the address (18 reads a light, a third
-            // of a 5 ms pass at 2x on an RTX 3070).
-            // As when the access stayed global: the accesses through this pointer that still do
-            // (atomics, stores) route among the program's buffers at run time, the pointer's
-            // holder included.
-            info.set.insert(candidates.front());
-            info.set.insert(StorageBufferAddr{.index = candidates.front().index,
-                                              .offset = candidates.front().offset});
-            info.native_runtime_bounds = true;
-            info.to_replace.push_back(StorageInst{
-                .storage_buffer{candidates.front()},
-                .inst = &inst,
-                .block = &block,
-                .loaded_pointer = single_loaded->low,
-                .null_phi = single_loaded->null_phi,
-            });
-            return true;
         } else if (candidates.size() > 1 || paired_found ||
                    (!candidates.empty() && info.native_dynamic.contains(start))) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
+            // Its own buffers, routed among alone when the candidates are complete and all bound
+            RoutedAccess routed{.inst = &inst, .arrays = it->second.arrays};
+            bool all_bound{it->second.complete};
             if (paired_found) {
                 // The paired pointer is the other input of the select or phi; bind it too.
                 info.competing_loaded_bound = true;
                 info.set.insert(*storage_buffer);
+                routed.buffers.insert(*storage_buffer);
                 if (IsGlobalMemoryWrite(inst)) {
                     info.writes.insert(*storage_buffer);
                 }
             }
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find(info.table_candidates, candidate) !=
-                    info.table_candidates.end()) {
+                if (ContainsAddr(info.table_candidates, candidate)) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
                     const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
@@ -1749,11 +1627,13 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                         (takes_binding(candidate) ? 1U : 0U) +
                         (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
+                        all_bound = false;
                         continue;
                     }
                     info.table_used += added;
                 }
                 info.set.insert(candidate);
+                routed.buffers.insert(candidate);
                 if (IsGlobalMemoryWrite(inst)) {
                     info.writes.insert(candidate);
                     info.unbounded_writes.insert(candidate);
@@ -1767,6 +1647,9 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             }
             if (accepted) {
                 info.native_runtime_bounds = true;
+                if (all_bound) {
+                    info.routed.push_back(std::move(routed));
+                }
                 return true;
             }
             // Only table entries, and no free binding for them: as if none had been found.
@@ -2298,8 +2181,7 @@ private:
 };
 
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
-IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment,
-                      const IR::Value& loaded_pointer) {
+IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     IR::U32 offset;
     if (const std::optional<LowAddrInfo> low_addr{TrackLowAddress(&inst)}) {
@@ -2311,10 +2193,8 @@ IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer
         offset = ir.UConvert(32, IR::U64{inst.Arg(0)});
     }
     // Subtract the least significant 32 bits from the guest offset. The result is the storage
-    // buffer offset in bytes. A pointer loaded from memory is the base of its own binding.
-    IR::U32 low_cbuf{loaded_pointer.IsEmpty()
-                         ? ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))
-                         : IR::U32{loaded_pointer}};
+    // buffer offset in bytes.
+    IR::U32 low_cbuf{ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))};
 
     // Align the offset base to match the host alignment requirements
     low_cbuf = ir.BitwiseAnd(low_cbuf, ir.Imm32(~(alignment - 1U)));
@@ -2423,45 +2303,6 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
         throw InvalidArgument("Invalid global memory opcode {}", inst.GetOpcode());
     }
 }
-/// The paths a phi that merges an address built from a loaded pointer with null takes, carried by
-/// phis beside it: that pointer's low word on the address's paths and zero on the null paths, and
-/// whether the address's path was taken. A pointer whose low word is zero is not null.
-struct PointerPaths {
-    IR::Value pointer;
-    IR::Value on_pointer;
-};
-PointerPaths PointerOrNull(IR::Program& program, IR::Inst& null_phi, const IR::Value& pointer) {
-    for (IR::Block* const block : program.blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (inst.GetOpcode() != IR::Opcode::Phi) {
-                break;
-            }
-            if (&inst != &null_phi) {
-                continue;
-            }
-            IR::Inst& mirror{*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
-            mirror.SetFlags(IR::Type::U32);
-            IR::Inst& taken{*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
-            taken.SetFlags(IR::Type::U1);
-            for (size_t arg = 0; arg < null_phi.NumArgs(); ++arg) {
-                const IR::Value operand{null_phi.Arg(arg).Resolve()};
-                IR::Value carried{pointer};
-                IR::Value carried_taken{true};
-                if (operand.IsImmediate()) {
-                    carried = IR::Value{0U};
-                    carried_taken = IR::Value{false};
-                } else if (operand.InstRecursive() == &null_phi) {
-                    carried = IR::Value{&mirror};
-                    carried_taken = IR::Value{&taken};
-                }
-                mirror.AddPhiOperand(null_phi.PhiBlock(arg), carried);
-                taken.AddPhiOperand(null_phi.PhiBlock(arg), carried_taken);
-            }
-            return PointerPaths{IR::Value{&mirror}, IR::Value{&taken}};
-        }
-    }
-    throw LogicError("Phi {} is in no block", fmt::ptr(&null_phi));
-}
 } // Anonymous namespace
 
 void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
@@ -2562,39 +2403,43 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                                                   : StorageWriteExtent{},
         });
     }
-    std::map<IR::Inst*, PointerPaths> null_mirrors;
+    // Among every bound buffer, the closest base at or below the address can belong to a buffer
+    // bound for another access. An access whose candidates are complete was built from one of
+    // them, so the backend routes it among them alone (one routing function per distinct set).
+    std::map<std::vector<u32>, u32> route_indices;
+    for (RoutedAccess& routed : info.routed) {
+        // A dynamic index can reach slots past those searched, bound for other accesses
+        for (const PointerArray& array : routed.arrays) {
+            for (const StorageBufferAddr& buffer : info.set) {
+                if (buffer.index == array.first.index && buffer.indirect == array.first.indirect &&
+                    buffer.offset >= array.first.offset &&
+                    (buffer.offset - array.first.offset) % array.stride == 0) {
+                    routed.buffers.insert(buffer);
+                }
+            }
+        }
+        if (routed.buffers.size() == info.set.size()) {
+            continue;
+        }
+        std::vector<u32> buffers;
+        for (const StorageBufferAddr& buffer : routed.buffers) {
+            buffers.push_back(static_cast<u32>(info.set.index_of(info.set.find(buffer))));
+        }
+        const auto [route, inserted] = route_indices.try_emplace(
+            buffers, static_cast<u32>(program.global_memory_routes.size()));
+        if (inserted) {
+            program.global_memory_routes.push_back(std::move(buffers));
+        }
+        program.global_memory_route.emplace(routed.inst, route->second);
+    }
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
         const auto it{info.set.find(storage_inst.storage_buffer)};
         const IR::U32 index{IR::Value{static_cast<u32>(info.set.index_of(it))}};
         IR::Block* const block{storage_inst.block};
         IR::Inst* const inst{storage_inst.inst};
-        if (storage_inst.null_phi != nullptr) {
-            // The address is built from the loaded pointer on some paths and is null on the
-            // others: carry the pointer or zero along the same paths, read from it and give the
-            // null paths the zero that no buffer holding the address reads as.
-            auto mirror{null_mirrors.find(storage_inst.null_phi)};
-            if (mirror == null_mirrors.end()) {
-                mirror = null_mirrors
-                             .emplace(storage_inst.null_phi,
-                                      PointerOrNull(program, *storage_inst.null_phi,
-                                                    storage_inst.loaded_pointer))
-                             .first;
-            }
-            const IR::U32 pointer{mirror->second.pointer};
-            const IR::U32 offset{StorageOffset(*block, *inst, storage_buffer,
-                                               u32(host_info.min_ssbo_alignment), pointer)};
-            const auto it_inst{IR::Block::InstructionList::s_iterator_to(*inst)};
-            const IR::Value read{&*block->PrependNewInst(
-                it_inst, GlobalToStorage(inst->GetOpcode()), {index, offset}, inst->Flags<u32>())};
-            IR::IREmitter ir{*block, it_inst};
-            inst->ReplaceUsesWith(
-                ir.Select(IR::U1{mirror->second.on_pointer}, IR::U32{read}, ir.Imm32(0)));
-            continue;
-        }
         const IR::U32 offset{
-            StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment),
-                          storage_inst.loaded_pointer)};
+            StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment))};
         Replace(*block, *inst, index, offset);
     }
 }
