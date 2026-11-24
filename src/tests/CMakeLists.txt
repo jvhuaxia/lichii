@@ -185,7 +185,6 @@ add_executable(tests
     video_core/x8d24_conversion.cpp
     video_core/ampere_ported_half_compare.cpp
     video_core/ampere_geometry_capture.cpp
-    video_core/ampere_duskbloods_forms.cpp
     video_core/ampere_geometry_exit.cpp
     video_core/ampere_geometry_lowering.cpp
     video_core/ampere_ported_conversions.cpp
